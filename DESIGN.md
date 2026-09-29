@@ -88,6 +88,7 @@ alloyflow/                        # Repository Root
 │
 ├── DESIGN.md
 ├── EXPERIMENT_LOG.md
+├── README.md
 └── pyproject.toml
 ```
 
