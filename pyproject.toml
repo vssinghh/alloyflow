@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alloyflow"
+version = "0.1.0"
+description = "Multi-task Vision Flow Matching for the 6-DoF SO-ARM101 across Sim, Real, Finetune, and Co-Training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Vipin Singh" }
+]
+dependencies = [
+    "mujoco>=3.1.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "torch>=2.0.0",
+    "h5py>=3.8.0",
+    "pillow>=9.0.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["envs*", "collection*", "training*", "evaluation*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["envs/tests", "collection/tests", "training/tests", "evaluation/tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
