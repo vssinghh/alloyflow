@@ -140,6 +140,7 @@ class SimEnv(SO101Env):
         self._init_cam_quat = self.model.cam_quat.copy()
         self._init_mat_rgba = self.model.mat_rgba.copy()
         self._init_geom_rgba = self.model.geom_rgba.copy()
+        self._init_geom_friction = self.model.geom_friction.copy()
         self._init_body_mass = self.model.body_mass.copy()
         self._init_body_inertia = self.model.body_inertia.copy()
         self._init_dof_damping = self.model.dof_damping.copy()
@@ -148,8 +149,11 @@ class SimEnv(SO101Env):
         self.current_task_id: int = 0
         self.current_step: int = 0
         self.initial_object_pos: dict[str, np.ndarray] = {}
+        self.initial_collision: bool = False
         self.max_bystander_displacement: float = 0.0
         self.bystander_tipped: bool = False
+        self.max_target_displacement: float = 0.0
+        self.target_tipped: bool = False
         self.last_domain_params: dict[str, Any] | None = None
 
     def restore_nominal_domain(self) -> None:
@@ -161,6 +165,7 @@ class SimEnv(SO101Env):
         self.model.cam_quat[:] = self._init_cam_quat
         self.model.mat_rgba[:] = self._init_mat_rgba
         self.model.geom_rgba[:] = self._init_geom_rgba
+        self.model.geom_friction[:] = self._init_geom_friction
         self.model.body_mass[:] = self._init_body_mass
         self.model.body_inertia[:] = self._init_body_inertia
         self.model.dof_damping[:] = self._init_dof_damping
@@ -169,32 +174,36 @@ class SimEnv(SO101Env):
     def sample_domain_params(self, rng: np.random.Generator) -> dict[str, Any]:
         """Sample Sim-to-Real visual and physical domain randomization parameters."""
         light_pos_delta = rng.uniform(-0.25, 0.25, size=self._init_light_pos.shape)
-        light_intensity_scale = float(rng.uniform(0.60, 1.35))
-        light_rgb_tint = rng.uniform(0.85, 1.15, size=(3,))
+        light_dir_delta = rng.uniform(-0.18, 0.18, size=self._init_light_dir.shape)
+        light_intensity_scale = float(rng.uniform(0.65, 1.35))
+        light_rgb_tint = rng.uniform(0.88, 1.12, size=(3,))
 
+        # Hue-preserving luminance scale + bounded channel tint so objects never camouflage
         mat_rgb: dict[str, list[float]] = {}
         for name, mid in self._mat_ids.items():
             base_rgb = self._init_mat_rgba[mid, :3]
-            scale = rng.uniform(0.60, 1.40, size=(3,))
-            shift = rng.uniform(-0.12, 0.12, size=(3,))
-            rgb = np.clip(base_rgb * scale + shift, 0.08, 0.96)
+            lum = float(rng.uniform(0.72, 1.28))
+            tint = rng.uniform(-0.05, 0.05, size=(3,))
+            rgb = np.clip(base_rgb * lum + tint, 0.08, 0.96)
             mat_rgb[name] = [float(v) for v in rgb]
 
         cam_pos_deltas: dict[str, list[float]] = {}
         cam_euler_deltas: dict[str, list[float]] = {}
         for cam_name in self._cam_ids:
-            pos_lim = 0.003 if cam_name == "wrist_cam" else 0.010
-            rot_lim = 0.008 if cam_name == "wrist_cam" else 0.015
+            pos_lim = 0.003 if cam_name == "wrist_cam" else 0.008
+            rot_lim = 0.008 if cam_name == "wrist_cam" else 0.012
             cam_pos_deltas[cam_name] = [float(v) for v in rng.uniform(-pos_lim, pos_lim, size=(3,))]
             cam_euler_deltas[cam_name] = [float(v) for v in rng.uniform(-rot_lim, rot_lim, size=(3,))]
 
         obj_mass_scales = {
-            name: float(rng.uniform(0.70, 1.50)) for name in OBJECT_NAMES
+            name: float(rng.uniform(0.75, 1.40)) for name in OBJECT_NAMES
         }
         arm_damping_scales = [float(v) for v in rng.uniform(0.85, 1.20, size=(6,))]
+        friction_scale = float(rng.uniform(0.85, 1.25))
 
         return {
             "light_pos_delta": [[float(v) for v in row] for row in light_pos_delta],
+            "light_dir_delta": [[float(v) for v in row] for row in light_dir_delta],
             "light_intensity_scale": light_intensity_scale,
             "light_rgb_tint": [float(v) for v in light_rgb_tint],
             "mat_rgb": mat_rgb,
@@ -202,6 +211,7 @@ class SimEnv(SO101Env):
             "cam_euler_deltas": cam_euler_deltas,
             "obj_mass_scales": obj_mass_scales,
             "arm_damping_scales": arm_damping_scales,
+            "friction_scale": friction_scale,
         }
 
     def apply_domain_params(self, params: dict[str, Any]) -> None:
@@ -211,6 +221,13 @@ class SimEnv(SO101Env):
         self.model.light_pos[:] = self._init_light_pos + np.array(
             params["light_pos_delta"], dtype=np.float64
         )
+        if "light_dir_delta" in params:
+            raw_dir = self._init_light_dir + np.array(
+                params["light_dir_delta"], dtype=np.float64
+            )
+            norms = np.linalg.norm(raw_dir, axis=-1, keepdims=True) + 1e-8
+            self.model.light_dir[:] = raw_dir / norms
+
         scale = float(params["light_intensity_scale"])
         tint = np.array(params["light_rgb_tint"], dtype=np.float32)[None, :]
         self.model.light_diffuse[:] = np.clip(
@@ -257,6 +274,12 @@ class SimEnv(SO101Env):
             self._dof_adrs, params.get("arm_damping_scales", [1.0] * 6)
         ):
             self.model.dof_damping[dof_adr] = self._init_dof_damping[dof_adr] * float(d_scale)
+
+        if "friction_scale" in params:
+            f_scale = float(params["friction_scale"])
+            self.model.geom_friction[:, 0] = np.clip(
+                self._init_geom_friction[:, 0] * f_scale, 0.20, 2.50
+            )
 
         self.last_domain_params = params
 
@@ -315,6 +338,7 @@ class SimEnv(SO101Env):
         task_id: int = 0,
         seed: int | None = None,
         object_xy_overrides: dict[str, tuple[float, float]] | None = None,
+        domain_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Reset the simulation to the home pose and spawn the 4 objects."""
         if task_id not in TASK_SPECS:
@@ -322,10 +346,15 @@ class SimEnv(SO101Env):
 
         self.current_task_id = int(task_id)
         self.current_step = 0
-        rng = np.random.default_rng(seed)
+        spawn_rng = np.random.default_rng(seed)
+        dr_rng = np.random.default_rng(
+            None if seed is None else int(seed) + 1_000_000
+        )
 
-        if self.domain_rand:
-            self.apply_domain_params(self.sample_domain_params(rng))
+        if domain_params is not None:
+            self.apply_domain_params(domain_params)
+        elif self.domain_rand:
+            self.apply_domain_params(self.sample_domain_params(dr_rng))
         else:
             self.restore_nominal_domain()
 
@@ -338,11 +367,11 @@ class SimEnv(SO101Env):
             self.data.qpos[q_adr] = float(raw_home[idx])
             self.data.ctrl[act_id] = float(raw_home[idx])
 
-        # Place the 4 tabletop objects
+        # Place the 4 tabletop objects using spawn_rng (independent of domain_rand)
         spawns_xy = (
             object_xy_overrides
             if object_xy_overrides is not None
-            else self._sample_object_spawns(rng)
+            else self._sample_object_spawns(spawn_rng)
         )
         for name in OBJECT_NAMES:
             q_adr = self._obj_qpos_adrs[name]
@@ -359,18 +388,21 @@ class SimEnv(SO101Env):
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
 
-        # Snapshot initial object 3D positions and reset bystander tracking
+        # Snapshot initial object 3D positions and reset bystander & target tracking
         self.initial_object_pos = {
             name: self.data.body(self._obj_body_ids[name]).xpos.copy()
             for name in OBJECT_NAMES
         }
+        self.initial_collision = self.has_initial_collision()
         self.max_bystander_displacement = 0.0
         self.bystander_tipped = False
+        self.max_target_displacement = 0.0
+        self.target_tipped = False
 
         return self.get_obs()
 
     def _update_bystander_metrics(self) -> None:
-        """Track peak XY movement and uprightness of non-task objects during the episode."""
+        """Track peak XY movement and uprightness of bystander and target objects."""
         spec = TASK_SPECS[self.current_task_id]
         for obj_name in spec.bystander_objects:
             bid = self._obj_body_ids[obj_name]
@@ -381,6 +413,17 @@ class SimEnv(SO101Env):
             up_z = float(self.data.body(bid).xmat.reshape(3, 3)[2, 2])
             if up_z < 0.80:
                 self.bystander_tipped = True
+
+        # Also monitor the target receptacle (bowl or rubiks_cube) against shoving or tipping
+        tgt_name = spec.target_object
+        tgt_bid = self._obj_body_ids[tgt_name]
+        tgt_cur = self.data.body(tgt_bid).xpos
+        tgt_init = self.initial_object_pos[tgt_name]
+        tgt_xy_disp = float(np.linalg.norm(tgt_cur[:2] - tgt_init[:2]))
+        self.max_target_displacement = max(self.max_target_displacement, tgt_xy_disp)
+        tgt_up_z = float(self.data.body(tgt_bid).xmat.reshape(3, 3)[2, 2])
+        if tgt_up_z < 0.90:
+            self.target_tipped = True
 
     def step(self, action_6d: np.ndarray) -> dict[str, Any]:
         """Step the simulation by 50 ms (20 Hz) with a 6D action vector."""
@@ -395,6 +438,7 @@ class SimEnv(SO101Env):
 
         for _ in range(self.substeps):
             mujoco.mj_step(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
 
         self.current_step += 1
         self._update_bystander_metrics()
@@ -406,7 +450,7 @@ class SimEnv(SO101Env):
         return float(xmat[2, 2]) >= min_cos
 
     def check_task_success(self, task_id: int | None = None) -> bool:
-        """Verify whether the target task goal is physically satisfied."""
+        """Verify whether the target task goal is physically satisfied and settled."""
         tid = self.current_task_id if task_id is None else int(task_id)
         spec = TASK_SPECS[tid]
 
@@ -420,39 +464,53 @@ class SimEnv(SO101Env):
         pinch_pos = self.data.site(self._pinch_site_id).xpos
         gripper_clear = grip_norm >= 0.45 and float(np.linalg.norm(pinch_pos - src_pos)) >= 0.035
 
-        if not self._is_object_upright(spec.source_object) or not gripper_clear:
+        # Check placed object is physically settled and target receptacle was not shoved or tipped
+        src_dof = self._obj_dof_adrs[spec.source_object]
+        src_speed = float(np.linalg.norm(self.data.qvel[src_dof : src_dof + 6]))
+        tgt_init = self.initial_object_pos.get(spec.target_object, tgt_pos)
+        tgt_disp = float(np.linalg.norm(tgt_pos[:2] - tgt_init[:2]))
+        tgt_stable = (
+            self._is_object_upright(spec.target_object, min_cos=0.92)
+            and tgt_disp <= self.MAX_BYSTANDER_DISTURBANCE_M
+            and not self.target_tipped
+        )
+
+        if not gripper_clear or not tgt_stable or src_speed > 0.25:
             return False
 
         if spec.goal_type == "place_inside":
-            # Pen holder or cup seated inside the bowl cavity
+            # Pen holder or cup seated upright inside the bowl cavity
             in_bowl_xy = xy_dist <= self.BOWL_INNER_RADIUS_M
-            in_bowl_z = (tgt_pos[2] + 0.012) <= src_pos[2] <= (tgt_pos[2] + 0.055)
-            return bool(in_bowl_xy and in_bowl_z)
+            in_bowl_z = (tgt_pos[2] + 0.008) <= src_pos[2] <= (tgt_pos[2] + 0.055)
+            src_upright = self._is_object_upright(spec.source_object, min_cos=0.85)
+            return bool(in_bowl_xy and in_bowl_z and src_upright)
 
         if spec.goal_type == "stack_on_top":
             # Cup stacked stably on top of the 5.6cm Rubik's cube
             on_cube_xy = xy_dist <= self.CUBE_STACK_XY_TOL_M
-            # Cube center is at z ~ 0.028 (top face at z ~ 0.056); cup center is 0.020 above its bottom -> z ~ 0.076
             expected_z = float(tgt_pos[2]) + 0.028 + 0.020
             on_cube_z = abs(float(src_pos[2]) - expected_z) <= 0.012
-            cube_upright = self._is_object_upright("rubiks_cube", min_cos=0.90)
-            return bool(on_cube_xy and on_cube_z and cube_upright)
+            src_upright = self._is_object_upright(spec.source_object, min_cos=0.88)
+            return bool(on_cube_xy and on_cube_z and src_upright)
 
         return False
 
     def check_constraints(self, task_id: int | None = None) -> dict[str, Any]:
-        """Return detailed breakdown of all 4 simulation quality & constraint checks."""
+        """Return detailed breakdown of all simulation quality & constraint checks."""
         tid = self.current_task_id if task_id is None else int(task_id)
         init_xy = {
             name: (float(pos[0]), float(pos[1]))
             for name, pos in self.initial_object_pos.items()
         }
-        spawn_clearance_ok = self.is_valid_spawn(
-            init_xy, min_clearance=self.MIN_SPAWN_CLEARANCE_M
+        spawn_clearance_ok = (
+            self.is_valid_spawn(init_xy, min_clearance=self.MIN_SPAWN_CLEARANCE_M)
+            and not self.initial_collision
         )
         bystander_ok = (
             self.max_bystander_displacement <= self.MAX_BYSTANDER_DISTURBANCE_M
             and not self.bystander_tipped
+            and self.max_target_displacement <= self.MAX_BYSTANDER_DISTURBANCE_M
+            and not self.target_tipped
         )
         task_success = self.check_task_success(tid)
 
@@ -461,6 +519,8 @@ class SimEnv(SO101Env):
             "bystander_ok": bool(bystander_ok),
             "max_bystander_displacement_m": float(self.max_bystander_displacement),
             "bystander_tipped": bool(self.bystander_tipped),
+            "max_target_displacement_m": float(self.max_target_displacement),
+            "target_tipped": bool(self.target_tipped),
             "task_success": bool(task_success),
             "all_constraints_passed": bool(
                 spawn_clearance_ok and bystander_ok and task_success

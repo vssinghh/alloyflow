@@ -37,21 +37,23 @@
       <geom name="desk_top" type="box" pos="0 0 0" size="0.35 0.38 0.02" material="wood_table" contype="1" conaffinity="1" friction="0.9 0.02 0.01"/>
     </body>
 
-    <!-- External Cameras (128x128 synchronized RGB streams) -->
-    <camera name="third_person_cam" pos="0.54 -0.28 0.32" xyaxes="0.50 0.866 0.0 -0.45 0.26 0.85" fovy="52"/>
-    <camera name="overhead_cam" pos="0.24 0.0 0.50" xyaxes="0.0 -1.0 0.0 1.0 0.0 0.0" fovy="52"/>
+    <!-- External Cameras (128x128 synchronized RGB streams with >=12px workspace margin) -->
+    <camera name="third_person_cam" pos="0.55 -0.27 0.33" xyaxes="0.45 0.893 0.0 -0.46 0.23 0.85" fovy="55"/>
+    <camera name="overhead_cam" pos="0.24 0.0 0.54" xyaxes="0.0 -1.0 0.0 1.0 0.0 0.0" fovy="55"/>
 
-    <!-- Object 1: Pen Holder (Tall square desktop pen caddy with stepped base, ~3.8 cm wide, 7.0 cm tall) -->
+    <!-- Object 1: Pen Holder (Tall square desktop pen caddy with stepped base, ~3.2 cm wide, 6.6 cm tall) -->
     <body name="pen_holder" pos="0.22 0.12 0.035">
       <freejoint name="pen_holder_joint"/>
       <inertial pos="0 0 -0.006" mass="0.050" diaginertia="2.4e-5 2.4e-5 1.4e-5"/>
-      <!-- Stepped square base flange -->
-      <geom name="pen_holder_base" type="box" pos="0 0 -0.031" size="0.022 0.022 0.004" material="pen_holder_mat" friction="1.4 0.03 0.01" solimp="0.95 0.99 0.001" solref="0.008 1"/>
-      <!-- Tall square body for grasping -->
-      <geom name="pen_holder_grasp_body" type="box" pos="0 0 0.0" size="0.018 0.018 0.033" material="pen_holder_mat" friction="1.6 0.04 0.02" solimp="0.95 0.99 0.001" solref="0.008 1"/>
+      <!-- Visual square desk caddy geoms (group 2, non-colliding so square corners never wedge) -->
+      <geom name="pen_holder_visual_base" type="box" pos="0 0 -0.031" size="0.018 0.018 0.004" material="pen_holder_mat" contype="0" conaffinity="0" group="2"/>
+      <geom name="pen_holder_visual_body" type="box" pos="0 0 0.0" size="0.0145 0.0145 0.028" material="pen_holder_mat" contype="0" conaffinity="0" group="2"/>
+      <!-- Smooth cylindrical collision proxy (group 3) for yaw-invariant grasping and bowl seating -->
+      <geom name="pen_holder_base" type="cylinder" pos="0 0 -0.031" size="0.0175 0.004" group="3" rgba="0 0 0 0" friction="1.4 0.03 0.01" solimp="0.95 0.99 0.001" solref="0.008 1"/>
+      <geom name="pen_holder_grasp_body" type="cylinder" pos="0 0 0.0" size="0.0155 0.028" group="3" rgba="0 0 0 0" friction="1.6 0.04 0.02" solimp="0.95 0.99 0.001" solref="0.008 1"/>
       <!-- Top rim trim & dark square hollow interior -->
-      <geom name="pen_holder_rim" type="box" pos="0 0 0.032" size="0.0195 0.0195 0.002" rgba="0.14 0.28 0.52 1" contype="0" conaffinity="0"/>
-      <geom name="pen_holder_inner_dark" type="box" pos="0 0 0.0338" size="0.014 0.014 0.0005" rgba="0.05 0.08 0.16 1" contype="0" conaffinity="0"/>
+      <geom name="pen_holder_rim" type="box" pos="0 0 0.028" size="0.016 0.016 0.002" rgba="0.14 0.28 0.52 1" contype="0" conaffinity="0"/>
+      <geom name="pen_holder_inner_dark" type="box" pos="0 0 0.0298" size="0.0115 0.0115 0.0005" rgba="0.05 0.08 0.16 1" contype="0" conaffinity="0"/>
       <site name="pen_holder_site" pos="0 0 0.002" size="0.004" rgba="0.2 0.4 0.8 0.5" group="3"/>
     </body>
 
@@ -78,8 +80,9 @@
       <!-- Smooth revolved visual meshes (outer teal ceramic + inner cream glaze) -->
       <geom name="bowl_visual_outer" type="mesh" mesh="bowl_outer" pos="0 0 -0.004" material="bowl_mat" contype="0" conaffinity="0" group="2"/>
       <geom name="bowl_visual_inner" type="mesh" mesh="bowl_inner" pos="0 0 -0.004" material="bowl_inner_mat" contype="0" conaffinity="0" group="2"/>
-      <!-- Invisible concave collision cavity (group 3) so placed objects settle smoothly inside -->
-      <geom name="bowl_base" type="cylinder" pos="0 0 0.0" size="0.036 0.004" group="3" rgba="0 0 0 0" friction="1.2 0.03 0.01"/>
+      <!-- Invisible concave collision cavity (group 3) with octagonal box floor to avoid CylinderBox normal inversion -->
+      <geom name="bowl_base" type="box" pos="0 0 0.0" size="0.028 0.028 0.004" group="3" rgba="0 0 0 0" friction="1.2 0.03 0.01"/>
+      <geom name="bowl_base_diag" type="box" pos="0 0 0.0" euler="0 0 0.7854" size="0.028 0.028 0.004" group="3" rgba="0 0 0 0" friction="1.2 0.03 0.01"/>
       <geom name="bowl_wall_0" type="box" pos="0.044 0.000 0.016" euler="0 -0.45 0.0000" size="0.003 0.019 0.018" group="3" rgba="0 0 0 0" friction="0.6 0.02 0.01"/>
       <geom name="bowl_wall_1" type="box" pos="0.0311 0.0311 0.016" euler="0.318 -0.318 0.7854" size="0.003 0.019 0.018" group="3" rgba="0 0 0 0" friction="0.6 0.02 0.01"/>
       <geom name="bowl_wall_2" type="box" pos="0.000 0.044 0.016" euler="0.45 0 1.5708" size="0.003 0.019 0.018" group="3" rgba="0 0 0 0" friction="0.6 0.02 0.01"/>

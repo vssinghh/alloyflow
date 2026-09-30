@@ -166,13 +166,13 @@ class RealEnv(SO101Env):
 
         self._write_action_6d(act)
         self.current_step += 1
-        obs = self.get_obs()
 
         if not self.mock_hardware:
             elapsed = time.perf_counter() - t0
             if elapsed < self.step_dt:
                 time.sleep(self.step_dt - elapsed)
-        return obs
+
+        return self.get_obs()
 
     def get_obs(self) -> dict[str, Any]:
         """Return observation dict with aligned 'proprio' and 'rgb_<cam>' keys."""

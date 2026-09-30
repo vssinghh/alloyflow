@@ -31,16 +31,32 @@ OBJECT_NAMES: tuple[str, ...] = (
 )
 
 # Neutral home pose (5 arm joints in radians + 1 normalized gripper in [0.0, 1.0])
-# Keeps the arm retracted at X ~ 0.16m so all 4 objects are unobstructed at t=0,
-# with wrist_roll = -pi/2 so the two jaws open horizontally along Y and wrist_cam sits on top.
+# Keeps the wrist retracted at X ~ 0.165m so all 4 objects (x >= 0.185m) are 100% unobstructed
+# in overhead_cam and third_person_cam at t=0, with wrist_roll = -pi/2.
 HOME_PROPRIO_6D = np.array(
-    [0.0, -0.95, 0.85, 0.75, -np.pi / 2, 1.0],
+    [0.0, -1.25, 1.15, 0.75, -np.pi / 2, 0.68],
     dtype=np.float32,
 )
 
 # Physical SO-ARM101 gripper hinge range Mapped to normalized [0.0 (closed), 1.0 (open)]
 GRIPPER_RAW_CLOSED: float = -0.15
 GRIPPER_RAW_OPEN: float = 0.85
+
+# Physical 6-DoF SO-ARM101 joint limits (5 arm joints in radians + normalized gripper in [0.0, 1.0])
+JOINT_LIMITS_LOW = np.array(
+    [-1.91986, -1.74533, -1.69, -1.65806, -2.74385, 0.0],
+    dtype=np.float32,
+)
+JOINT_LIMITS_HIGH = np.array(
+    [1.91986, 1.74533, 1.69, 1.65806, 2.84121, 1.0],
+    dtype=np.float32,
+)
+
+# Disjoint RNG seed partitions to prevent train/eval spatial or DR leakage
+SIM_TRAIN_BASE_SEED: int = 1_000
+SIM_EVAL_ID_BASE_SEED: int = 50_000
+SIM_EVAL_OOD_BASE_SEED: int = 80_000
+REAL_TRAIN_BASE_SEED: int = 90_000
 
 # Feetech STS3215 12-bit magnetic encoder resolution (4096 ticks per 2*pi radians)
 STS3215_TICKS_PER_REV: int = 4096
