@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from training.config import AlloyTrainConfig
+from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
 
 
 class SpatialSoftmax2d(nn.Module):
@@ -66,10 +66,10 @@ class SpatialSoftmaxConvNet(nn.Module):
 
     def __init__(
         self,
-        num_keypoints: int = 32,
-        vision_feat_dim: int = 32,
-        task_emb_dim: int = 32,
-        img_size: int = 128,
+        num_keypoints: int = DEFAULT_TRAIN_CONFIG.num_keypoints,
+        vision_feat_dim: int = DEFAULT_TRAIN_CONFIG.vision_feat_dim,
+        task_emb_dim: int = DEFAULT_TRAIN_CONFIG.task_emb_dim,
+        img_size: int = DEFAULT_TRAIN_CONFIG.img_size,
     ) -> None:
         super().__init__()
         if img_size % 8 != 0:
@@ -135,11 +135,11 @@ class MultiCameraAttention(nn.Module):
 
     def __init__(
         self,
-        num_cameras: int = 3,
-        vision_feat_dim: int = 32,
-        proprio_emb_dim: int = 64,
-        task_emb_dim: int = 32,
-        num_heads: int = 4,
+        num_cameras: int = len(DEFAULT_TRAIN_CONFIG.camera_names),
+        vision_feat_dim: int = DEFAULT_TRAIN_CONFIG.vision_feat_dim,
+        proprio_emb_dim: int = DEFAULT_TRAIN_CONFIG.proprio_emb_dim,
+        task_emb_dim: int = DEFAULT_TRAIN_CONFIG.task_emb_dim,
+        num_heads: int = DEFAULT_TRAIN_CONFIG.num_attn_heads,
     ) -> None:
         super().__init__()
         self.num_cameras = int(num_cameras)
@@ -200,7 +200,7 @@ class MultiCameraAttention(nn.Module):
 class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal embedding for continuous flow time tau in [0, 1]."""
 
-    def __init__(self, dim: int = 64) -> None:
+    def __init__(self, dim: int = DEFAULT_TRAIN_CONFIG.time_emb_dim) -> None:
         super().__init__()
         self.dim = int(dim)
         half = self.dim // 2
@@ -216,7 +216,7 @@ class SinusoidalTimeEmbedding(nn.Module):
 class ResMLPBlock(nn.Module):
     """Pre-norm Residual MLP block with LayerNorm and SiLU."""
 
-    def __init__(self, hidden_dim: int = 256) -> None:
+    def __init__(self, hidden_dim: int = DEFAULT_TRAIN_CONFIG.hidden_dim) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(hidden_dim),
@@ -234,9 +234,9 @@ class ResMLPBlock(nn.Module):
 class TaskConditionedVisionFlowPolicy(nn.Module):
     """End-to-end 3-Task Vision Flow Matching Policy for the 6-DoF SO-ARM101."""
 
-    def __init__(self, config: AlloyTrainConfig | None = None) -> None:
+    def __init__(self, config: AlloyTrainConfig = DEFAULT_TRAIN_CONFIG) -> None:
         super().__init__()
-        self.config = config or AlloyTrainConfig()
+        self.config = config
         cfg = self.config
 
         # 1. Task Embedding Lookup Table (3 tasks -> 32D)

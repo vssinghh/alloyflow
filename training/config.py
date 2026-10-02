@@ -26,7 +26,8 @@ class AlloyTrainConfig:
     sim_data_path: str = "data/sim_demos.h5"
     real_data_path: str = "data/real_demos.h5"
     pretrained_checkpoint: str | None = None
-    save_dir: str = "checkpoints/sim_only"
+    default_finetune_checkpoint: str = "checkpoints/sim_only/best_policy.pt"
+    save_dir: str = ""
     real_ratio: float = 0.5
 
     # Sensor & action dimensions (SO-ARM101 6-DoF at 20 Hz)
@@ -72,6 +73,8 @@ class AlloyTrainConfig:
             raise ValueError(
                 f"Invalid train_mode '{self.train_mode}'. Must be one of {VALID_TRAIN_MODES}."
             )
+        if not self.save_dir:
+            object.__setattr__(self, "save_dir", f"checkpoints/{self.train_mode}")
         if not (0.0 < self.real_ratio < 1.0) and self.train_mode == "cotrain":
             raise ValueError(
                 f"real_ratio must be in (0.0, 1.0) for cotrain mode, got {self.real_ratio}."
@@ -132,3 +135,6 @@ class AlloyTrainConfig:
         if "camera_names" in filtered and isinstance(filtered["camera_names"], list):
             filtered["camera_names"] = tuple(filtered["camera_names"])
         return cls(**filtered)
+
+
+DEFAULT_TRAIN_CONFIG = AlloyTrainConfig()

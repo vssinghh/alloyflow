@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 
-from training.config import VALID_TRAIN_MODES, AlloyTrainConfig
+from training.config import DEFAULT_TRAIN_CONFIG, VALID_TRAIN_MODES, AlloyTrainConfig
 from training.trainer import PolicyTrainer
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    d = DEFAULT_TRAIN_CONFIG
     parser = argparse.ArgumentParser(
         prog="python -m training",
         description="Train AlloyFlow 3-task Vision Flow Matching policy across 4 modes.",
@@ -17,73 +18,73 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mode",
         type=str,
         choices=VALID_TRAIN_MODES,
-        default="sim_only",
+        default=d.train_mode,
         help="Training regime: sim_only, real_only, finetune, or cotrain.",
     )
     parser.add_argument(
         "--sim-data",
         type=str,
-        default="data/sim_demos.h5",
+        default=d.sim_data_path,
         help="Path to simulation demonstrations HDF5 file.",
     )
     parser.add_argument(
         "--real-data",
         type=str,
-        default="data/real_demos.h5",
+        default=d.real_data_path,
         help="Path to real-world demonstrations HDF5 file.",
     )
     parser.add_argument(
         "--pretrained-checkpoint",
         type=str,
-        default=None,
-        help="Pretrained checkpoint path (required when --mode finetune).",
+        default=d.pretrained_checkpoint,
+        help="Pretrained checkpoint path (defaults to default_finetune_checkpoint in finetune mode).",
     )
     parser.add_argument(
         "--save-dir",
         type=str,
-        default=None,
+        default="",
         help="Directory to save checkpoints (defaults to checkpoints/<mode>).",
     )
     parser.add_argument(
         "--real-ratio",
         type=float,
-        default=0.5,
+        default=d.real_ratio,
         help="Fraction of each minibatch drawn from real data in cotrain mode.",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20,
+        default=d.epochs,
         help="Number of training epochs.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=128,
+        default=d.batch_size,
         help="Minibatch size.",
     )
     parser.add_argument(
         "--lr",
         type=float,
         default=None,
-        help="Learning rate override (defaults to 5e-4, or 1e-4 for finetune).",
+        help="Learning rate override (defaults to config.effective_lr).",
     )
     parser.add_argument(
         "--flow-samples",
         type=int,
-        default=4,
+        default=d.num_flow_samples,
         help="Number of stratified flow timesteps K evaluated per CNN pass.",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=d.seed,
         help="Random seed for reproducible training.",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="auto",
+        default=d.device,
         help="Compute device: auto, mps, cuda, or cpu.",
     )
     return parser.parse_args(argv)
@@ -91,27 +92,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    save_dir = args.save_dir or f"checkpoints/{args.mode}"
+    d = DEFAULT_TRAIN_CONFIG
     pretrained = args.pretrained_checkpoint
     if args.mode == "finetune" and pretrained is None:
-        pretrained = "checkpoints/sim_only/best_policy.pt"
+        pretrained = d.default_finetune_checkpoint
 
-    lr = args.lr if args.lr is not None else (1e-4 if args.mode == "finetune" else 5e-4)
+    config_kwargs = {
+        "train_mode": args.mode,
+        "sim_data_path": args.sim_data,
+        "real_data_path": args.real_data,
+        "pretrained_checkpoint": pretrained,
+        "save_dir": args.save_dir,
+        "real_ratio": args.real_ratio,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "num_flow_samples": args.flow_samples,
+        "seed": args.seed,
+        "device": args.device,
+    }
+    if args.lr is not None:
+        config_kwargs["lr"] = args.lr
 
-    config = AlloyTrainConfig(
-        train_mode=args.mode,
-        sim_data_path=args.sim_data,
-        real_data_path=args.real_data,
-        pretrained_checkpoint=pretrained,
-        save_dir=save_dir,
-        real_ratio=args.real_ratio,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=lr,
-        num_flow_samples=args.flow_samples,
-        seed=args.seed,
-        device=args.device,
-    )
+    config = AlloyTrainConfig(**config_kwargs)
     trainer = PolicyTrainer(config=config)
     summary = trainer.train(verbose=True)
     print(

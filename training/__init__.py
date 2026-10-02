@@ -1,6 +1,6 @@
 """AlloyFlow policy training package (4-mode multi-task Vision Flow Matching)."""
 
-from training.config import VALID_TRAIN_MODES, AlloyTrainConfig
+from training.config import DEFAULT_TRAIN_CONFIG, VALID_TRAIN_MODES, AlloyTrainConfig
 from training.dataset import (
     HDF5DemoDataset,
     MultiModeBatchLoader,
@@ -23,6 +23,7 @@ from training.trainer import (
 )
 
 __all__ = [
+    "DEFAULT_TRAIN_CONFIG",
     "VALID_TRAIN_MODES",
     "AlloyTrainConfig",
     "ConditionalFlowMatcher",

@@ -9,15 +9,15 @@ import numpy as np
 import torch
 
 from envs.base import JOINT_LIMITS_HIGH, JOINT_LIMITS_LOW
-from training.config import AlloyTrainConfig
+from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
 from training.model import TaskConditionedVisionFlowPolicy
 
 
 class ConditionalFlowMatcher:
     """Optimal-Transport Conditional Flow Matching with K-sample stratified amortization."""
 
-    def __init__(self, config: AlloyTrainConfig | None = None) -> None:
-        self.config = config or AlloyTrainConfig()
+    def __init__(self, config: AlloyTrainConfig = DEFAULT_TRAIN_CONFIG) -> None:
+        self.config = config
         weights = torch.ones(self.config.action_dim, dtype=torch.float32)
         weights[-1] = float(self.config.gripper_weight)
         self._dim_weights = weights
@@ -159,9 +159,9 @@ class TemporalEnsembler:
 
     def __init__(
         self,
-        chunk_size: int = 16,
-        action_dim: int = 6,
-        decay: float = 0.05,
+        chunk_size: int = DEFAULT_TRAIN_CONFIG.chunk_size,
+        action_dim: int = DEFAULT_TRAIN_CONFIG.action_dim,
+        decay: float = DEFAULT_TRAIN_CONFIG.temporal_ensemble_decay,
     ) -> None:
         self.chunk_size = int(chunk_size)
         self.action_dim = int(action_dim)

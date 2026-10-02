@@ -11,11 +11,13 @@ import h5py
 import numpy as np
 import torch
 
-from envs.base import CAMERA_NAMES
-from training.config import AlloyTrainConfig
+from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
 
 
-def build_action_chunks(actions: np.ndarray, chunk_size: int = 16) -> np.ndarray:
+def build_action_chunks(
+    actions: np.ndarray,
+    chunk_size: int = DEFAULT_TRAIN_CONFIG.chunk_size,
+) -> np.ndarray:
     """Slice (T, 6) episode actions into (T, chunk_size, 6) chunks with terminal hold padding.
 
     For steps near the end of an episode (t + h >= T), repeats the final action actions[T - 1]
@@ -41,9 +43,9 @@ class HDF5DemoDataset:
     def __init__(
         self,
         h5_path: str | Path,
-        chunk_size: int = 16,
-        camera_names: tuple[str, ...] = CAMERA_NAMES,
-        rolling_window_size: int = 8192,
+        chunk_size: int = DEFAULT_TRAIN_CONFIG.chunk_size,
+        camera_names: tuple[str, ...] = DEFAULT_TRAIN_CONFIG.camera_names,
+        rolling_window_size: int = DEFAULT_TRAIN_CONFIG.rolling_window_size,
     ) -> None:
         self.h5_path = Path(h5_path)
         if not self.h5_path.exists():
@@ -205,7 +207,7 @@ class HDF5DemoDataset:
 def compute_combined_norm_stats(
     sim_dataset: HDF5DemoDataset,
     real_dataset: HDF5DemoDataset,
-    real_ratio: float = 0.5,
+    real_ratio: float = DEFAULT_TRAIN_CONFIG.real_ratio,
 ) -> dict[str, torch.Tensor]:
     """Compute weighted normalization statistics across Sim and Real datasets for co-training."""
     w_real = float(np.clip(real_ratio, 0.0, 1.0))
