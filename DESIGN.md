@@ -149,24 +149,107 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 
 We collect **`20` clean demos per task (`60` total)** into `data/alloy_real_demos.h5`.
 
-### 4.3 HDF5 File Format (`data/alloy_sim_demos.h5` & `data/alloy_real_demos.h5`)
+### 4.3 HDF5 File Format (`data/sim_demos.h5` & `data/real_demos.h5`)
 ```text
-alloy_<domain>_demos.h5
+<domain>_demos.h5
 ├── attrs:
-│   ├── domain: "sim" | "real"
+│   ├── num_episodes: N
+│   ├── num_cameras: 3
 │   ├── control_hz: 20
-│   └── cameras: ["third_person_cam", "overhead_cam", "wrist_cam"]
-└── data/
-    └── demo_0/
-        ├── attrs:
-        │   ├── task_id: 0 | 1 | 2
-        │   ├── domain: "sim" | "real"
-        │   ├── seed: int
-        │   └── num_samples: T
-        ├── actions                    # float32 (T, 6) (commanded joint targets)
-        └── obs/
-            ├── proprio                # float32 (T, 6) (current joint positions)
-            ├── rgb_third_person_cam   # uint8   (T, 128, 128, 3)
-            ├── rgb_overhead_cam       # uint8   (T, 128, 128, 3)
-            └── rgb_wrist_cam          # uint8   (T, 128, 128, 3)
+│   └── camera_names: ["third_person_cam", "overhead_cam", "wrist_cam"]
+└── demo_0000/
+    ├── attrs:
+    │   ├── task_id: 0 | 1 | 2
+    │   ├── task_name: str
+    │   ├── domain: "sim_clean" | "sim_dr" | "real"
+    │   ├── seed: int
+    │   └── num_steps: T
+    ├── actions                        # float32 (T, 6) (commanded joint targets)
+    └── obs/
+        ├── proprio                    # float32 (T, 6) (current joint positions)
+        ├── rgb_third_person_cam       # uint8   (T, 128, 128, 3)
+        ├── rgb_overhead_cam           # uint8   (T, 128, 128, 3)
+        └── rgb_wrist_cam              # uint8   (T, 128, 128, 3)
 ```
+
+***
+
+## 5. Policy Architecture & 4-Mode Training Pipeline (`training/`)
+
+All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the exact same **`TaskConditionedVisionFlowPolicy`** network (`~1.10M` parameters) so benchmark comparisons isolate the effect of the training data regime.
+
+### 5.1 End-to-End Architecture Diagram (`TaskConditionedVisionFlowPolicy`)
+
+![AlloyFlow Policy Architecture](assets/architecture.png)
+
+```text
+[1. Inputs (20 Hz)]          [2. Encoders]                 [3. Camera Attention]         [4. Fusion]        [5. Flow Head & Output]
+third_person (128x128x3) ──> Spatial Softmax CNN 1 (32D) ──┐
+overhead     (128x128x3) ──> Spatial Softmax CNN 2 (32D) ──┼──> Multi-Camera Attention ──> 96D ──┐
+wrist        (128x128x3) ──> Spatial Softmax CNN 3 (32D) ──┘    (Query: Proprio + Task)          ├──> 192D ──> 4-Block Flow ResMLP (256D)
+proprio q_t  (6D)        ──> Proprio MLP           (64D) ──────────────────────────────────> 64D ──┤             └──> 16x6 Action Chunk
+task_id      (0, 1, 2)   ──> Task Lookup Table     (32D) ──────────────────────────────────> 32D ──┘                  (10-Step Euler + TE)
+```
+
+### 5.2 Detailed Layer-by-Layer Specification
+
+1. **Task Embedding (`nn.Embedding(3, 32)`)**:
+   - Maps discrete `task_id in {0, 1, 2}` to a learnable `32D` task vector $\mathbf{z}_{\text{task}} \in \mathbb{R}^{32}$.
+   - Shared across three modules: (a) Task `FiLM` inside each camera CNN, (b) the Multi-Camera Attention query, and (c) the `192D` fused vector entering the `ResMLP`.
+
+2. **Proprioception MLP (`6D -> 64D -> 64D`)**:
+   - Normalizes raw `6D` joint state $\mathbf{q}_t$ (`5` arm joints in radians + `1` gripper in `[0, 1]`) via dataset z-score statistics ($\tilde{\mathbf{q}}_t = (\mathbf{q}_t - \boldsymbol{\mu}_q) / \boldsymbol{\sigma}_q$, stored inside checkpoint buffers).
+   - Passes $\tilde{\mathbf{q}}_t$ through two `Linear + LayerNorm(64) + SiLU` layers to produce $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$.
+
+3. **Tri-Camera Spatial Softmax CNN with Task `FiLM` (`3 x SpatialSoftmaxConvNet`)**:
+   - Three independent encoders (one each for `third_person_cam`, `overhead_cam`, and `wrist_cam`).
+   - During training, applies $\pm 4\text{ px}$ random bilinear shift augmentation (`shift_pad = 4`).
+   - **4 Conv Blocks (`GroupNorm(8) + SiLU`)**:
+     - `Conv1`: `(3 -> 32, k=3, stride=2, pad=1)` $\to$ `(B, 32, 64, 64)`
+     - `Conv2`: `(32 -> 64, k=3, stride=2, pad=1)` $\to$ `(B, 64, 32, 32)`
+     - `Conv3`: `(64 -> 64, k=3, stride=2, pad=1)` $\to$ `(B, 64, 16, 16)`
+     - `Conv4`: `(64 -> 32, k=3, stride=1, pad=1)` + **Task `FiLM`** ($\tilde{f}_c = (1 + \gamma_c(\mathbf{z}_{\text{task}})) f_c + \beta_c(\mathbf{z}_{\text{task}})$) $\to$ `(B, 32, 16, 16)`
+   - **2D Spatial Softmax (`32` Keypoints)**:
+     - Softmaxes each `16x16` heatmap into a 2D probability distribution $P_c(u, v)$ and computes the expected coordinate $(\mu_{c,x}, \mu_{c,y}) \in [-1, +1]^2$ across all `32` channels (`64D` coordinate vector per camera).
+   - **Camera Token Projection**:
+     - `Linear(64 -> 32) + LayerNorm(32) + SiLU` outputs $\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}} \in \mathbb{R}^{32}$.
+
+4. **Multi-Camera Attention (`3` Side-by-Side Attended Slots = `96D`) & Fusion (`192D`)**:
+   - **Query (`Q`)**: Projected from $[\mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{96}$ into `4` heads (`4 x 8D = 32D`).
+   - **Keys (`K`) & Values (`V`)**: Projected from stacked camera tokens $[\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}}] \in \mathbb{R}^{3 \times 32}$ into `4` heads (`3 x 4 x 8D`).
+   - **Attention Weights**: Computes per-head camera weights $[\alpha_{\text{tp}}, \alpha_{\text{ov}}, \alpha_{\text{wr}}] = \text{Softmax}(Q K^\top / \sqrt{8})$ comparing what the robot needs (`Q`) against what each camera currently sees (`K`).
+   - **Side-by-Side Output (`96D`)**: Multiplies each camera's Value vector by its attention weight and keeps all 3 weighted camera vectors side by side (`[\alpha_tp * V_tp (32D), \alpha_ov * V_ov (32D), \alpha_wr * V_wr (32D)] -> 96D`). This suppresses unhelpful views (such as `wrist_cam` at $t = 0$) in place without collapsing the 3 cameras into a single `32D` vector or needing an un-gated raw camera copy.
+   - **Fused Conditioning Vector (`192D`)**:
+     $$\mathbf{z}_{\text{fused}} = [\tilde{\mathbf{z}}_{\text{tp}} (32\text{D}) \,;\, \tilde{\mathbf{z}}_{\text{ov}} (32\text{D}) \,;\, \tilde{\mathbf{z}}_{\text{wr}} (32\text{D}) \,;\, \mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{192}$$
+
+5. **Optimal-Transport Conditional Flow Matching Head (`4-Block ResMLP` + `K = 4` Stratified Sampling)**:
+   - **Target Action Chunk ($x_1$)**: Next `16` steps of `6D` joint commands `(16, 6)` (`0.8 s` at `20 Hz`), z-score normalized using `action_mean` and `action_std`. At episode boundaries (`t > T - 16`), steps beyond `T - 1` repeat `actions[T - 1]` so the robot holds its final retracted pose cleanly.
+   - **Stratified Flow Amortization (`K = 4`)**:
+     - Computes $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ **once** per minibatch through the 3 CNNs (`98.9%` of compute) and evaluates the lightweight `ResMLP` (`1.1%` of compute) across `K = 4` stratified flow timesteps $\tau_{i,k} = \frac{k + u_{i,k}}{4}$ for $k \in \{0, 1, 2, 3\}$ and $u_{i,k} \sim \mathcal{U}(0, 1)$.
+   - **Straight-Line Interpolation & Velocity Loss**:
+     - Samples $x_0 \sim \mathcal{N}(0, I)$, forms $x_\tau = (1 - \tau) x_0 + \tau x_1$, and trains $v_\theta(x_\tau, \tau \mid \mathbf{z}_{\text{fused}})$ to match $u_\tau = x_1 - x_0$ using dimension-weighted MSE with `gripper_weight = 2.5` on joint `5`.
+   - **Closed-Loop Inference (`20 Hz`)**:
+     - Integrates $v_\theta$ from $\tau = 0 \to 1$ in `10` Euler steps ($\Delta \tau = 0.1$) and blends overlapping `16`-step predictions using **Temporal Ensembling** ($w_i = \exp(-0.05 \cdot i)$).
+
+### 5.3 The 4 Training Modes & Locked Hyperparameters (`training/config.py`)
+
+| Mode Flag | Training Dataset(s) | Batch Sampling | Learning Rate | Normalization Stats (`norm_stats`) |
+| :--- | :--- | :--- | :---: | :--- |
+| **`sim_only`** | `data/sim_demos.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos.h5` & saved in checkpoint |
+| **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
+| **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
+| **`cotrain`** | `data/sim_demos.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
+
+| Hyperparameter | Default Value | Purpose |
+| :--- | :---: | :--- |
+| `chunk_size` (`H`) | `16` | `0.8 s` future action horizon at `20 Hz`. |
+| `num_keypoints` / `vision_feat_dim` | `32` / `32` | `32` `(x, y)` keypoints (`64D`) projected to `32D` per camera. |
+| `task_emb_dim` / `proprio_emb_dim` | `32` / `64` | Task lookup embedding and 2-layer proprioception MLP dimensions. |
+| `fused_dim` | `192` | `96D (3 attended cameras) + 64D (proprio) + 32D (task)`. |
+| `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`~1.10M` total policy parameters). |
+| `num_flow_samples` (`K`) | `4` | Stratified flow timesteps per CNN forward pass. |
+| `gripper_weight` | `2.5` | Loss weight on gripper dimension `5` (`1.0` on arm dimensions `0..4`). |
+| `shift_pad` | `4` | Random $\pm 4\text{ px}$ bilinear shift augmentation during training. |
+| `batch_size` / `epochs` | `128` / `20` | `80` effective flow passes per sample (`20 * K`), AdamW (`wd = 1e-4`). |
+| `ode_steps` / `temporal_ensemble_decay` | `10` / `0.05` | Euler ODE integration steps and $w_i = \exp(-0.05 \cdot i)$ blending. |
+
