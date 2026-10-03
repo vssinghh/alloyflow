@@ -16,11 +16,11 @@ from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
 class SpatialSoftmax2d(nn.Module):
     """Differentiable 2D Spatial Softmax layer that extracts expected (x, y) keypoints."""
 
-    def __init__(self, height: int = 16, width: int = 16, temperature: float = 1.0) -> None:
+    def __init__(self, height: int = 8, width: int = 8, temperature: float = 1.0) -> None:
         super().__init__()
         self.height = int(height)
         self.width = int(width)
-        self.temperature = float(temperature)
+        self.temperature = nn.Parameter(torch.tensor(float(temperature), dtype=torch.float32))
 
         pos_x, pos_y = torch.meshgrid(
             torch.linspace(-1.0, 1.0, self.height),
@@ -32,13 +32,18 @@ class SpatialSoftmax2d(nn.Module):
         self.register_buffer("grid_y", pos_x.reshape(1, 1, self.height * self.width))
 
     def forward(
-        self, features: torch.Tensor, return_keypoints: bool = False
+        self,
+        features: torch.Tensor,
+        return_keypoints: bool = False,
+        viz_temperature: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute expected (x, y) coordinates in [-1, 1] for each channel.
 
         Args:
             features: (B, C, H, W) activation heatmaps.
             return_keypoints: If True, also return (B, C, 2) keypoint tensor.
+            viz_temperature: Optional sharp temperature for diagnostic visualization
+                to remove post-GroupNorm background dilution without altering flat_coords.
 
         Returns:
             flat_coords: (B, 2 * C) concatenated [x_0, y_0, x_1, y_1, ...] coordinates.
@@ -48,8 +53,9 @@ class SpatialSoftmax2d(nn.Module):
             raise ValueError(
                 f"Expected feature map spatial size ({self.height}, {self.width}), got ({h}, {w})."
             )
-        flat = features.reshape(b, c, h * w) / max(self.temperature, 1e-4)
-        probs = F.softmax(flat, dim=-1)
+        temp = self.temperature.abs().clamp(min=1e-4)
+        flat = features.reshape(b, c, h * w)
+        probs = F.softmax(flat / temp, dim=-1)
 
         exp_x = torch.sum(probs * self.grid_x, dim=-1)
         exp_y = torch.sum(probs * self.grid_y, dim=-1)
@@ -57,12 +63,18 @@ class SpatialSoftmax2d(nn.Module):
         flat_coords = keypoints.reshape(b, 2 * c)  # (B, 2 * C)
 
         if return_keypoints:
+            if viz_temperature is not None:
+                viz_probs = F.softmax(flat / max(float(viz_temperature), 1e-4), dim=-1)
+                viz_x = torch.sum(viz_probs * self.grid_x, dim=-1)
+                viz_y = torch.sum(viz_probs * self.grid_y, dim=-1)
+                viz_kp = torch.stack([viz_x, viz_y], dim=-1)
+                return flat_coords, viz_kp
             return flat_coords, keypoints
         return flat_coords
 
 
 class SpatialSoftmaxConvNet(nn.Module):
-    """4-layer ConvNet with GroupNorm, Task FiLM modulation, and 2D Spatial Softmax."""
+    """4-layer ConvNet with GroupNorm, Task FiLM modulation, and 8x8 2D Spatial Softmax."""
 
     def __init__(
         self,
@@ -70,37 +82,39 @@ class SpatialSoftmaxConvNet(nn.Module):
         vision_feat_dim: int = DEFAULT_TRAIN_CONFIG.vision_feat_dim,
         task_emb_dim: int = DEFAULT_TRAIN_CONFIG.task_emb_dim,
         img_size: int = DEFAULT_TRAIN_CONFIG.img_size,
+        keypoint_noise: float = DEFAULT_TRAIN_CONFIG.keypoint_noise,
     ) -> None:
         super().__init__()
-        if img_size % 8 != 0:
-            raise ValueError(f"img_size ({img_size}) must be divisible by 8.")
-        feat_h = img_size // 8
+        if img_size % 16 != 0:
+            raise ValueError(f"img_size ({img_size}) must be divisible by 16.")
+        feat_h = img_size // 16
+        self.keypoint_noise = float(keypoint_noise)
 
         self.block1 = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.GroupNorm(8, 32),
+            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
+            nn.GroupNorm(4, 32),
             nn.SiLU(),
         )
         self.block2 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
         )
         self.block3 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.SiLU(),
         )
-        self.conv4 = nn.Conv2d(64, num_keypoints, kernel_size=3, stride=1, padding=1, bias=False)
-        self.gn4 = nn.GroupNorm(8, num_keypoints)
+        self.conv4 = nn.Conv2d(64, num_keypoints, kernel_size=3, stride=2, padding=1)
+        self.gn4 = nn.GroupNorm(4, num_keypoints)
 
         # Task-conditioned FiLM modulation: (1 + gamma) * f + beta before Spatial Softmax
         self.task_film = nn.Linear(task_emb_dim, 2 * num_keypoints)
-        nn.init.zeros_(self.task_film.weight)
+        nn.init.normal_(self.task_film.weight, std=0.02)
         nn.init.zeros_(self.task_film.bias)
 
         self.act4 = nn.SiLU()
-        self.spatial_softmax = SpatialSoftmax2d(height=feat_h, width=feat_h)
+        self.spatial_softmax = SpatialSoftmax2d(height=feat_h, width=feat_h, temperature=1.0)
         self.proj = nn.Sequential(
             nn.Linear(2 * num_keypoints, vision_feat_dim),
             nn.LayerNorm(vision_feat_dim),
@@ -124,9 +138,16 @@ class SpatialSoftmaxConvNet(nn.Module):
         x = self.act4(x)
 
         if return_keypoints:
-            flat_coords, kp = self.spatial_softmax(x, return_keypoints=True)
+            viz_temp = 0.08 if not self.training else None
+            flat_coords, kp = self.spatial_softmax(
+                x, return_keypoints=True, viz_temperature=viz_temp
+            )
+            if self.training and self.keypoint_noise > 0.0:
+                flat_coords = flat_coords + torch.randn_like(flat_coords) * self.keypoint_noise
             return self.proj(flat_coords), kp
         flat_coords = self.spatial_softmax(x, return_keypoints=False)
+        if self.training and self.keypoint_noise > 0.0:
+            flat_coords = flat_coords + torch.randn_like(flat_coords) * self.keypoint_noise
         return self.proj(flat_coords)
 
 
@@ -155,6 +176,7 @@ class MultiCameraAttention(nn.Module):
             nn.Linear(vision_feat_dim, vision_feat_dim),
             nn.LayerNorm(vision_feat_dim),
         )
+        self.slot_norm = nn.LayerNorm(vision_feat_dim)
 
     def forward(
         self,
@@ -186,10 +208,11 @@ class MultiCameraAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn_weights = F.softmax(scores, dim=-1)  # sums to 1.0 across the 3 cameras
 
-        # Multiply each camera's Value by its attention weight and keep all 3 slots side by side
-        # attn_weights.transpose(-2, -1) is (B, H, N_cams, 1); v is (B, H, N_cams, D_h)
-        weighted_v = attn_weights.transpose(-2, -1) * v  # (B, H, N_cams, D_h)
-        attended_slots = weighted_v.transpose(1, 2).reshape(b, n_cams * d)  # (B, 96)
+        # Multiply each camera's Value by (n_cams * attn_weight) with residual + LayerNorm per slot
+        weighted_v = (n_cams * attn_weights.transpose(-2, -1)) * v  # (B, H, N_cams, D_h)
+        weighted_slots = weighted_v.transpose(1, 2).reshape(b, n_cams, d)  # (B, N_cams, D)
+        normed_slots = self.slot_norm(cam_tokens + weighted_slots)
+        attended_slots = normed_slots.reshape(b, n_cams * d)  # (B, 96)
 
         if return_weights:
             mean_weights = attn_weights.squeeze(2).mean(dim=1)  # (B, N_cams)
@@ -209,21 +232,27 @@ class SinusoidalTimeEmbedding(nn.Module):
 
     def forward(self, tau: torch.Tensor) -> torch.Tensor:
         """Map scalar or batched tau (...) to (..., dim) sinusoidal features."""
-        angles = tau.unsqueeze(-1).float() * self.freqs * 1000.0
+        angles = tau.unsqueeze(-1).float() * self.freqs
         return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
 class ResMLPBlock(nn.Module):
-    """Pre-norm Residual MLP block with LayerNorm and SiLU."""
+    """Pre-norm Residual MLP block with LayerNorm, SiLU, and Dropout."""
 
-    def __init__(self, hidden_dim: int = DEFAULT_TRAIN_CONFIG.hidden_dim) -> None:
+    def __init__(
+        self,
+        hidden_dim: int = DEFAULT_TRAIN_CONFIG.hidden_dim,
+        dropout: float = DEFAULT_TRAIN_CONFIG.dropout,
+    ) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
@@ -242,9 +271,9 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         # 1. Task Embedding Lookup Table (3 tasks -> 32D)
         self.task_embedding = nn.Embedding(cfg.num_tasks, cfg.task_emb_dim)
 
-        # 2. Proprioception MLP (6D -> 64D -> 64D)
+        # 2. Causal Proprioception History MLP (18D -> 64D -> 64D)
         self.proprio_mlp = nn.Sequential(
-            nn.Linear(cfg.proprio_dim, cfg.proprio_emb_dim),
+            nn.Linear(cfg.proprio_input_dim, cfg.proprio_emb_dim),
             nn.LayerNorm(cfg.proprio_emb_dim),
             nn.SiLU(),
             nn.Linear(cfg.proprio_emb_dim, cfg.proprio_emb_dim),
@@ -260,6 +289,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
                     vision_feat_dim=cfg.vision_feat_dim,
                     task_emb_dim=cfg.task_emb_dim,
                     img_size=cfg.img_size,
+                    keypoint_noise=cfg.keypoint_noise,
                 )
                 for cam in cfg.camera_names
             }
@@ -279,7 +309,10 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         self.obs_proj = nn.Sequential(
             nn.Linear(cfg.fused_dim, cfg.hidden_dim),
             nn.LayerNorm(cfg.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
         )
+        self.obs_dropout = nn.Dropout(cfg.dropout)
         self.act_proj = nn.Linear(chunk_flat_dim, cfg.hidden_dim)
         self.time_encoder = nn.Sequential(
             SinusoidalTimeEmbedding(cfg.time_emb_dim),
@@ -288,7 +321,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
         )
         self.res_blocks = nn.ModuleList(
-            [ResMLPBlock(cfg.hidden_dim) for _ in range(cfg.num_res_blocks)]
+            [ResMLPBlock(cfg.hidden_dim, dropout=cfg.dropout) for _ in range(cfg.num_res_blocks)]
         )
         self.out_head = nn.Sequential(
             nn.LayerNorm(cfg.hidden_dim),
@@ -362,15 +395,60 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         task_ids: torch.Tensor,
         return_aux: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
-        """Encode 3 camera views, 6D proprioception, and task ID into a (B, 192) fused vector."""
+        """Encode 3 camera views, causal proprioception history, and task ID into a (B, 192) vector."""
+        cfg = self.config
         z_task = self.task_embedding(task_ids.long())  # (B, 32)
-        q_norm = self.normalize_proprio(obs["proprio"].float())
-        z_prop = self.proprio_mlp(q_norm)  # (B, 64)
+        if "proprio_history" in obs:
+            prop_hist_raw = obs["proprio_history"].float()
+        else:
+            prop_single = obs["proprio"].float()
+            if prop_single.ndim == 2:
+                prop_hist_raw = (
+                    prop_single.unsqueeze(1)
+                    .expand(-1, cfg.num_proprio_frames, -1)
+                    .contiguous()
+                )
+            else:
+                prop_hist_raw = prop_single
+
+        q_hist_norm = self.normalize_proprio(prop_hist_raw)  # (B, K_hist, 6)
+        q_curr = q_hist_norm[:, 0, :].clone()
+        dq_deltas: list[torch.Tensor] = []
+        for lag_i in range(1, cfg.num_proprio_frames):
+            dq = (q_hist_norm[:, 0, :] - q_hist_norm[:, lag_i, :]).clone()
+            # Zero horizontal pan velocity so history carries only vertical/gripper phase transitions
+            dq[:, 0] = 0.0
+            dq_deltas.append(dq)
+
+        if self.training:
+            if "anchor_home_pan" in obs:
+                anchor_mask = obs["anchor_home_pan"].bool()
+                home_pan_norm = (0.0 - self.proprio_mean[0]) / self.proprio_std[0]
+                q_curr[:, 0] = torch.where(anchor_mask, home_pan_norm, q_curr[:, 0])
+            if cfg.proprio_noise_std > 0.0:
+                q_curr = q_curr + torch.randn_like(q_curr) * cfg.proprio_noise_std
+                for i in range(len(dq_deltas)):
+                    dq_deltas[i] = (
+                        dq_deltas[i] + torch.randn_like(dq_deltas[i]) * cfg.proprio_noise_std
+                    )
+                    dq_deltas[i][:, 0] = 0.0
+            if cfg.pan_noise_std > 0.0:
+                q_curr[:, 0] = (
+                    q_curr[:, 0] + torch.randn_like(q_curr[:, 0]) * cfg.pan_noise_std
+                )
+
+        prop_feat_in = torch.cat([q_curr, *dq_deltas], dim=-1)  # (B, 18)
+        z_prop = self.proprio_mlp(prop_feat_in)  # (B, 64)
+        if self.training and cfg.proprio_drop_prob > 0.0:
+            keep_prop = (
+                torch.rand((q_curr.shape[0], 1), device=q_curr.device) >= cfg.proprio_drop_prob
+            ).float()
+            z_prop = z_prop * keep_prop
 
         cam_tokens_list: list[torch.Tensor] = []
         keypoints_dict: dict[str, torch.Tensor] = {}
 
-        for cam in self.config.camera_names:
+        for cam in cfg.camera_names:
             key = f"rgb_{cam}" if f"rgb_{cam}" in obs else cam
             img = obs[key]
             if img.dtype == torch.uint8:
@@ -386,6 +464,11 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
                 keypoints_dict[cam] = kp
             else:
                 token = self.camera_encoders[cam](img, z_task, return_keypoints=False)
+            if self.training and cfg.wrist_cam_drop_prob > 0.0 and cam == "wrist_cam":
+                keep_cam = (
+                    torch.rand((img.shape[0], 1), device=img.device) >= cfg.wrist_cam_drop_prob
+                ).float()
+                token = token * keep_cam
             cam_tokens_list.append(token)
 
         cam_tokens = torch.stack(cam_tokens_list, dim=1)  # (B, 3, 32)
@@ -422,7 +505,8 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         if x_tau.ndim == 3:
             b = x_tau.shape[0]
             flat_x = x_tau.reshape(b, cfg.chunk_size * cfg.action_dim)
-            h = self.obs_proj(z_fused) + self.act_proj(flat_x) + self.time_encoder(tau)
+            obs_emb = self.obs_dropout(self.obs_proj(z_fused))
+            h = obs_emb + self.act_proj(flat_x) + self.time_encoder(tau)
             for block in self.res_blocks:
                 h = block(h)
             out = self.out_head(h)
@@ -431,7 +515,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         if x_tau.ndim == 4:
             b, k, _, _ = x_tau.shape
             flat_x = x_tau.reshape(b, k, cfg.chunk_size * cfg.action_dim)
-            obs_emb = self.obs_proj(z_fused).unsqueeze(1)  # (B, 1, 256) broadcast across K
+            obs_emb = self.obs_dropout(self.obs_proj(z_fused)).unsqueeze(1)  # (B, 1, 256) broadcast across K
             act_emb = self.act_proj(flat_x)  # (B, K, 256)
             time_emb = self.time_encoder(tau)  # (B, K, 256)
             h = obs_emb + act_emb + time_emb

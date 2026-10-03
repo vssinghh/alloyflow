@@ -34,6 +34,7 @@ class AlloyTrainConfig:
     camera_names: tuple[str, ...] = CAMERA_NAMES
     img_size: int = 128
     proprio_dim: int = 6
+    proprio_history_lags: tuple[int, ...] = (0, 4, 8)
     action_dim: int = 6
     chunk_size: int = 16
     num_tasks: int = NUM_TASKS
@@ -45,13 +46,20 @@ class AlloyTrainConfig:
     vision_feat_dim: int = 32
     num_attn_heads: int = 4
 
-    # Flow Matching ResMLP backbone dimensions
+    # Flow Matching ResMLP backbone & regularization dimensions
     hidden_dim: int = 256
     num_res_blocks: int = 4
     time_emb_dim: int = 64
     num_flow_samples: int = 4
     gripper_weight: float = 2.5
     shift_pad: int = 4
+    dropout: float = 0.05
+    keypoint_noise: float = 0.01
+    proprio_noise_std: float = 0.05
+    pan_noise_std: float = 0.25
+    proprio_drop_prob: float = 0.20
+    wrist_cam_drop_prob: float = 0.10
+    home_anchor_prob: float = 0.65
 
     # Optimization schedule
     batch_size: int = 128
@@ -92,6 +100,16 @@ class AlloyTrainConfig:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}.")
 
     @property
+    def num_proprio_frames(self) -> int:
+        """Number of causal proprioception history frames (e.g., lags 0, 4, 8 -> 3)."""
+        return len(self.proprio_history_lags)
+
+    @property
+    def proprio_input_dim(self) -> int:
+        """Total flattened causal proprioception dimension (3 * 6 = 18)."""
+        return self.num_proprio_frames * self.proprio_dim
+
+    @property
     def attended_cam_dim(self) -> int:
         """Total dimension of side-by-side attended camera slots (3 * 32 = 96)."""
         return len(self.camera_names) * self.vision_feat_dim
@@ -122,6 +140,7 @@ class AlloyTrainConfig:
         """Serialize configuration to a JSON-compatible dictionary."""
         data = asdict(self)
         data["camera_names"] = list(self.camera_names)
+        data["proprio_history_lags"] = list(self.proprio_history_lags)
         return data
 
     @classmethod
@@ -134,6 +153,12 @@ class AlloyTrainConfig:
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         if "camera_names" in filtered and isinstance(filtered["camera_names"], list):
             filtered["camera_names"] = tuple(filtered["camera_names"])
+        if "proprio_history_lags" in filtered and isinstance(
+            filtered["proprio_history_lags"], list
+        ):
+            filtered["proprio_history_lags"] = tuple(
+                int(x) for x in filtered["proprio_history_lags"]
+            )
         return cls(**filtered)
 
 
