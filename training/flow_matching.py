@@ -53,7 +53,16 @@ class ConditionalFlowMatcher:
         device = actions.device
 
         # 1. Encode cameras + proprio + task once per batch: (B, 192)
-        z_fused = policy.extract_obs_features(obs, task_id, return_aux=False)
+        use_aux_pos = (
+            self.config.aux_pos_loss_weight > 0.0
+            and "obj_xy" in batch
+            and "obj_xy_mask" in batch
+        )
+        if use_aux_pos:
+            z_fused, aux = policy.extract_obs_features(obs, task_id, return_aux=True)
+        else:
+            z_fused = policy.extract_obs_features(obs, task_id, return_aux=False)
+            aux = {}
 
         # 2. Normalize target action chunk x_1: (B, 1, 16, 6)
         x_1 = policy.normalize_actions(actions).unsqueeze(1)
@@ -81,7 +90,50 @@ class ConditionalFlowMatcher:
         sq_err = (v_pred - u_target).pow(2)
         dim_w = self._dim_weights.to(device=device).view(1, 1, 1, -1)
         weighted_loss = torch.sum(sq_err * dim_w, dim=-1) / torch.sum(dim_w)
-        loss = weighted_loss.mean()
+        cfm_loss = weighted_loss.mean()
+
+        # 7. Training-only auxiliary 12D tabletop object XY loss (predictions NOT in z_fused)
+        aux_pos_loss = torch.zeros((), device=device, dtype=torch.float32)
+        if use_aux_pos:
+            head_weights = {
+                "overhead_cam": 1.0,
+                "third_person_cam": 1.0,
+                "wrist_cam": 0.25,
+                "fused": 1.0,
+            }
+            w_total = float(sum(head_weights.values()))
+            mask = batch["obj_xy_mask"].float()
+            mask_sum = mask.sum()
+            mask_denom = mask_sum.clamp(min=1.0)
+            mask_active = (mask_sum > 0.0).float()
+
+            y_norm = policy.normalize_obj_xy(batch["obj_xy"].float())
+            pos_preds = policy.predict_aux_positions(
+                aux["cam_tokens"], aux["attended_cams"], aux["z_task"]
+            )
+            demo_pos_loss = torch.zeros((), device=device, dtype=torch.float32)
+            for h_name, h_w in head_weights.items():
+                if h_name in pos_preds:
+                    diff_sq = (pos_preds[h_name] - y_norm).pow(2) * mask
+                    demo_pos_loss = demo_pos_loss + h_w * (diff_sq.sum() / mask_denom)
+            aux_pos_loss = (demo_pos_loss / w_total) * mask_active
+
+            if "loc_replay" in batch:
+                loc_b = batch["loc_replay"]
+                _, loc_aux = policy.extract_obs_features(
+                    loc_b["obs"], loc_b["task_id"], return_aux=True
+                )
+                loc_y_norm = policy.normalize_obj_xy(loc_b["obj_xy"].float())
+                loc_preds = policy.predict_aux_positions(
+                    loc_aux["cam_tokens"], loc_aux["attended_cams"], loc_aux["z_task"]
+                )
+                loc_loss = torch.zeros((), device=device, dtype=torch.float32)
+                for h_name, h_w in head_weights.items():
+                    if h_name in loc_preds:
+                        loc_loss = loc_loss + h_w * (loc_preds[h_name] - loc_y_norm).pow(2).mean()
+                aux_pos_loss = 0.5 * aux_pos_loss + 0.5 * (loc_loss / w_total)
+
+        loss = cfm_loss + float(self.config.aux_pos_loss_weight) * aux_pos_loss
 
         with torch.no_grad():
             arm_mse = sq_err[..., :5].mean().detach()
@@ -90,6 +142,8 @@ class ConditionalFlowMatcher:
 
         return {
             "loss": loss,
+            "cfm_loss": cfm_loss.detach(),
+            "aux_pos_loss": aux_pos_loss.detach(),
             "arm_mse": arm_mse,
             "gripper_mse": gripper_mse,
             "v_norm": v_norm,

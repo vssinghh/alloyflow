@@ -315,11 +315,32 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             nn.Linear(cfg.hidden_dim, chunk_flat_dim),
         )
 
+        # 6. Training-only 12D tabletop object XY heads (NOT concatenated into z_fused)
+        cam_pos_in_dim = cfg.vision_feat_dim + cfg.task_emb_dim
+        self.aux_cam_pos_heads = nn.ModuleDict(
+            {
+                cam: nn.Sequential(
+                    nn.Linear(cam_pos_in_dim, 128),
+                    nn.SiLU(),
+                    nn.Linear(128, 12),
+                )
+                for cam in cfg.camera_names
+            }
+        )
+        fused_pos_in_dim = cfg.attended_cam_dim + cfg.task_emb_dim
+        self.aux_fused_pos_head = nn.Sequential(
+            nn.Linear(fused_pos_in_dim, 128),
+            nn.SiLU(),
+            nn.Linear(128, 12),
+        )
+
         # Persistent z-score normalization buffers saved inside model checkpoints
         self.register_buffer("proprio_mean", torch.zeros(cfg.proprio_dim))
         self.register_buffer("proprio_std", torch.ones(cfg.proprio_dim))
         self.register_buffer("action_mean", torch.zeros(cfg.action_dim))
         self.register_buffer("action_std", torch.ones(cfg.action_dim))
+        self.register_buffer("obj_xy_mean", torch.zeros(12))
+        self.register_buffer("obj_xy_std", torch.ones(12))
         self.register_buffer("stats_initialized", torch.tensor(False, dtype=torch.bool))
 
     def set_norm_stats(self, stats: dict[str, torch.Tensor | np.ndarray]) -> None:
@@ -333,7 +354,21 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         self.action_std.copy_(
             torch.as_tensor(stats["action_std"], dtype=torch.float32, device=device).clamp(min=1e-2)
         )
+        if "obj_xy_mean" in stats and "obj_xy_std" in stats:
+            self.set_obj_xy_stats(stats["obj_xy_mean"], stats["obj_xy_std"])
         self.stats_initialized.fill_(True)
+
+    def set_obj_xy_stats(
+        self,
+        mean: torch.Tensor | np.ndarray,
+        std: torch.Tensor | np.ndarray,
+    ) -> None:
+        """Load 12D tabletop object XY normalization statistics into persistent buffers."""
+        device = self.obj_xy_mean.device
+        self.obj_xy_mean.copy_(torch.as_tensor(mean, dtype=torch.float32, device=device))
+        self.obj_xy_std.copy_(
+            torch.as_tensor(std, dtype=torch.float32, device=device).clamp(min=1e-2)
+        )
 
     def get_norm_stats(self) -> dict[str, torch.Tensor]:
         """Return current normalization statistics as CPU tensors."""
@@ -342,6 +377,8 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             "proprio_std": self.proprio_std.detach().cpu().clone(),
             "action_mean": self.action_mean.detach().cpu().clone(),
             "action_std": self.action_std.detach().cpu().clone(),
+            "obj_xy_mean": self.obj_xy_mean.detach().cpu().clone(),
+            "obj_xy_std": self.obj_xy_std.detach().cpu().clone(),
         }
 
     def normalize_proprio(self, proprio: torch.Tensor) -> torch.Tensor:
@@ -355,6 +392,27 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
     def unnormalize_actions(self, actions_norm: torch.Tensor) -> torch.Tensor:
         """Convert normalized action predictions back to physical SO-ARM101 units."""
         return actions_norm * self.action_std + self.action_mean
+
+    def normalize_obj_xy(self, obj_xy: torch.Tensor) -> torch.Tensor:
+        """Z-score normalize 12D tabletop object XY coordinates."""
+        return (obj_xy - self.obj_xy_mean) / self.obj_xy_std
+
+    def unnormalize_obj_xy(self, obj_xy_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalized 12D object XY predictions back to meters."""
+        return obj_xy_norm * self.obj_xy_std + self.obj_xy_mean
+
+    def predict_aux_positions(
+        self,
+        cam_tokens: dict[str, torch.Tensor],
+        attended_cams: torch.Tensor,
+        z_task: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Predict normalized 12D tabletop XY targets from each camera token and attended slots."""
+        preds: dict[str, torch.Tensor] = {}
+        for cam, tok in cam_tokens.items():
+            preds[cam] = self.aux_cam_pos_heads[cam](torch.cat([tok, z_task], dim=-1))
+        preds["fused"] = self.aux_fused_pos_head(torch.cat([attended_cams, z_task], dim=-1))
+        return preds
 
     def _augment_shift(self, img: torch.Tensor) -> torch.Tensor:
         """Apply random +-shift_pad pixel translation via bilinear border-padded grid sampling."""
@@ -420,6 +478,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             z_prop = z_prop * keep_prop
 
         cam_tokens_list: list[torch.Tensor] = []
+        cam_tokens_dict: dict[str, torch.Tensor] = {}
         keypoints_dict: dict[str, torch.Tensor] = {}
 
         for cam in cfg.camera_names:
@@ -438,6 +497,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
                 keypoints_dict[cam] = kp
             else:
                 token = self.camera_encoders[cam](img, z_task, return_keypoints=False)
+            cam_tokens_dict[cam] = token
             if self.training and cfg.wrist_cam_drop_prob > 0.0 and cam == "wrist_cam":
                 keep_cam = (
                     torch.rand((img.shape[0], 1), device=img.device) >= cfg.wrist_cam_drop_prob
@@ -460,6 +520,9 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             return z_fused, {
                 "keypoints": keypoints_dict,
                 "camera_weights": attn_weights,
+                "cam_tokens": cam_tokens_dict,
+                "attended_cams": attended_cams,
+                "z_task": z_task,
             }
         return z_fused
 

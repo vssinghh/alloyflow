@@ -22,6 +22,7 @@ htmlcov/
 # Data and checkpoints
 data/*.h5
 data/*.hdf5
+data/*.npz
 checkpoints/*
 !checkpoints/README.md
 *.mp4

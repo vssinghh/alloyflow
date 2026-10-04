@@ -58,6 +58,9 @@ class AlloyTrainConfig:
     proprio_noise_std: float = 0.02
     proprio_drop_prob: float = 0.10
     wrist_cam_drop_prob: float = 0.05
+    aux_pos_loss_weight: float = 0.5
+    pretrain_loc_steps: int = 3000
+    loc_data_path: str = "data/loc_layouts_3000.npz"
     val_samples_per_epoch: int = 512
 
     # Optimization schedule

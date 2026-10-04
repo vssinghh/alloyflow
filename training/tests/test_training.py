@@ -302,6 +302,7 @@ def test_four_mode_trainer_and_checkpoint_roundtrip(tmp_path: Path) -> None:
         epochs=2,
         batch_size=16,
         num_flow_samples=2,
+        pretrain_loc_steps=0,
         device="cpu",
     )
     sim_trainer = PolicyTrainer(sim_cfg)

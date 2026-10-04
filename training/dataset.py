@@ -11,7 +11,24 @@ import h5py
 import numpy as np
 import torch
 
+from envs.base import OBJECT_NAMES, TASK_SPECS
+from envs.sim_env import SimEnv
 from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
+
+
+def _compute_episode_layout_12d(
+    spawns_xy: dict[str, tuple[float, float]],
+    task_id: int,
+) -> np.ndarray:
+    """Build 12D tabletop XY target: [src_xy(2), tgt_xy(2), pen_xy(2), cup_xy(2), bowl_xy(2), cube_xy(2)]."""
+    spec = TASK_SPECS[int(task_id)]
+    src_xy = np.asarray(spawns_xy[spec.source_object][:2], dtype=np.float32)
+    tgt_xy = np.asarray(spawns_xy[spec.target_object][:2], dtype=np.float32)
+    all_xy = np.concatenate(
+        [np.asarray(spawns_xy[name][:2], dtype=np.float32) for name in OBJECT_NAMES],
+        axis=0,
+    )
+    return np.concatenate([src_xy, tgt_xy, all_xy], axis=0).astype(np.float32)
 
 
 def build_action_chunks(
@@ -126,6 +143,7 @@ class HDF5DemoDataset:
         self.trim_stationary = bool(trim_stationary)
         self.proprio_history_lags = tuple(int(x) for x in proprio_history_lags)
 
+        dummy_sim_env: SimEnv | None = None
         with h5py.File(self.h5_path, "r") as f:
             root = f["data"] if "data" in f and isinstance(f["data"], h5py.Group) else f
             raw_keys = sorted(k for k in root if k.startswith("demo_"))
@@ -191,6 +209,8 @@ class HDF5DemoDataset:
                 (total_steps, self.chunk_size, 6), dtype=torch.float32
             )
             self.task_ids = torch.empty((total_steps,), dtype=torch.long)
+            self.obj_xy = torch.zeros((total_steps, 12), dtype=torch.float32)
+            self.obj_xy_mask = torch.zeros((total_steps, 12), dtype=torch.float32)
             self.rgb_cache: dict[str, torch.Tensor] = {
                 cam: torch.empty((total_steps, h, w, c), dtype=torch.uint8)
                 for cam in self.camera_names
@@ -216,6 +236,26 @@ class HDF5DemoDataset:
                 self.action_chunks[cursor:end] = torch.from_numpy(filt_c)
                 self.task_ids[cursor:end] = tid
 
+                if "seed" in grp.attrs:
+                    if dummy_sim_env is None:
+                        dummy_sim_env = SimEnv(include_rgb=False)
+                    ep_seed = int(grp.attrs["seed"])
+                    spawns_xy = dummy_sim_env._sample_object_spawns(
+                        np.random.default_rng(ep_seed)
+                    )
+                    layout_12d = _compute_episode_layout_12d(spawns_xy, tid)
+                    self.obj_xy[cursor:end] = torch.from_numpy(layout_12d).unsqueeze(0)
+
+                    # Target object and non-source objects remain at spawn XY for all steps;
+                    # source object stays at spawn XY during initial approach/descend (raw_idx < 45)
+                    mask_ep = np.ones((t_ep, 12), dtype=np.float32)
+                    moved = filt_idx >= 45
+                    mask_ep[moved, 0:2] = 0.0
+                    src_name = TASK_SPECS[tid].source_object
+                    src_slot = OBJECT_NAMES.index(src_name)
+                    mask_ep[moved, 4 + 2 * src_slot : 6 + 2 * src_slot] = 0.0
+                    self.obj_xy_mask[cursor:end] = torch.from_numpy(mask_ep)
+
                 obs_grp = grp["obs"]
                 for cam in self.camera_names:
                     cam_key = f"rgb_{cam}" if f"rgb_{cam}" in obs_grp else cam
@@ -226,6 +266,9 @@ class HDF5DemoDataset:
                 self.domain_counts[dom] += 1
                 cursor = end
 
+        if dummy_sim_env is not None:
+            dummy_sim_env.close()
+
         self.norm_stats = self.compute_norm_stats()
 
     def __len__(self) -> int:
@@ -233,11 +276,21 @@ class HDF5DemoDataset:
 
     def compute_norm_stats(self) -> dict[str, torch.Tensor]:
         """Compute per-dimension mean and std (clamped >= 1e-2) across all steps."""
+        valid_layout_rows = self.obj_xy_mask[:, 0] > 0.5
+        if torch.any(valid_layout_rows):
+            xy_valid = self.obj_xy[valid_layout_rows]
+            obj_mean = xy_valid.mean(dim=0)
+            obj_std = xy_valid.std(dim=0).clamp(min=1e-2)
+        else:
+            obj_mean = torch.zeros(12, dtype=torch.float32)
+            obj_std = torch.ones(12, dtype=torch.float32)
         return {
             "proprio_mean": self.proprio.mean(dim=0),
             "proprio_std": self.proprio.std(dim=0).clamp(min=1e-2),
             "action_mean": self.actions.mean(dim=0),
             "action_std": self.actions.std(dim=0).clamp(min=1e-2),
+            "obj_xy_mean": obj_mean,
+            "obj_xy_std": obj_std,
         }
 
     def sample_epoch_permutation(
@@ -282,6 +335,8 @@ class HDF5DemoDataset:
         proprio_hist_b = self.proprio_history[idx_cpu].to(device=device, non_blocking=True)
         actions_b = self.action_chunks[idx_cpu].to(device=device, non_blocking=True)
         task_id_b = self.task_ids[idx_cpu].to(device=device, non_blocking=True)
+        obj_xy_b = self.obj_xy[idx_cpu].to(device=device, non_blocking=True)
+        obj_xy_mask_b = self.obj_xy_mask[idx_cpu].to(device=device, non_blocking=True)
 
         obs_b: dict[str, torch.Tensor] = {
             "proprio": proprio_b,
@@ -297,6 +352,8 @@ class HDF5DemoDataset:
             "obs": obs_b,
             "task_id": task_id_b,
             "actions": actions_b,
+            "obj_xy": obj_xy_b,
+            "obj_xy_mask": obj_xy_mask_b,
         }
 
 
@@ -332,6 +389,8 @@ def compute_combined_norm_stats(
         "proprio_std": torch.sqrt(p_var).clamp(min=1e-2),
         "action_mean": a_mean,
         "action_std": torch.sqrt(a_var).clamp(min=1e-2),
+        "obj_xy_mean": s_stats["obj_xy_mean"],
+        "obj_xy_std": s_stats["obj_xy_std"],
     }
 
 
@@ -465,6 +524,10 @@ class MultiModeBatchLoader:
                 "obs": merged_obs,
                 "task_id": torch.cat([sim_batch["task_id"], real_batch["task_id"]], dim=0),
                 "actions": torch.cat([sim_batch["actions"], real_batch["actions"]], dim=0),
+                "obj_xy": torch.cat([sim_batch["obj_xy"], real_batch["obj_xy"]], dim=0),
+                "obj_xy_mask": torch.cat(
+                    [sim_batch["obj_xy_mask"], real_batch["obj_xy_mask"]], dim=0
+                ),
             }
 
     def get_validation_batch(self, num_samples: int = 512) -> dict[str, Any]:

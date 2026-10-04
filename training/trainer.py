@@ -11,10 +11,16 @@ import numpy as np
 import torch
 from torch import nn
 
+from envs.base import CAMERA_NAMES
 from training.config import AlloyTrainConfig
 from training.dataset import HDF5DemoDataset, MultiModeBatchLoader
 from training.flow_matching import ConditionalFlowMatcher
 from training.model import TaskConditionedVisionFlowPolicy
+from training.pretrain_vision import (
+    evaluate_policy_localization,
+    load_demo_frame0_validation,
+    pretrain_vision_encoders,
+)
 
 
 def save_policy_checkpoint(
@@ -58,7 +64,7 @@ def load_policy_checkpoint(
         dev = torch.device(device)
 
     policy = TaskConditionedVisionFlowPolicy(cfg).to(dev)
-    policy.load_state_dict(raw_ckpt["model_state_dict"])
+    policy.load_state_dict(raw_ckpt["model_state_dict"], strict=False)
     if "norm_stats" in raw_ckpt:
         policy.set_norm_stats(raw_ckpt["norm_stats"])
     policy.eval()
@@ -97,7 +103,7 @@ class PolicyTrainer:
                     f"Pretrained checkpoint for finetune not found: {ckpt_path}"
                 )
             raw_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            self.policy.load_state_dict(raw_ckpt["model_state_dict"])
+            self.policy.load_state_dict(raw_ckpt["model_state_dict"], strict=False)
             # Keep normalization stats locked from the pretrained checkpoint
             if "norm_stats" in raw_ckpt:
                 self.policy.set_norm_stats(raw_ckpt["norm_stats"])
@@ -122,6 +128,49 @@ class PolicyTrainer:
         np.random.seed(seed)
         torch.manual_seed(seed)
 
+    def _load_loc_replay_tensors(self) -> dict[str, torch.Tensor] | None:
+        """Load cached 3,000-layout localization dataset into CPU tensors for Stage 2 replay."""
+        npz_path = Path(self.config.loc_data_path)
+        if not npz_path.exists():
+            return None
+        raw = np.load(npz_path)
+        out: dict[str, torch.Tensor] = {
+            "task_id": torch.as_tensor(raw["task_id"], dtype=torch.long),
+            "obj_xy": torch.as_tensor(raw["targets_12d"], dtype=torch.float32),
+            "proprio": torch.as_tensor(raw["proprio"], dtype=torch.float32),
+        }
+        for cam in CAMERA_NAMES:
+            out[f"rgb_{cam}"] = (
+                torch.as_tensor(raw[f"rgb_{cam}"], dtype=torch.uint8)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+            )
+        return out
+
+    def _sample_loc_replay_batch(
+        self,
+        loc_tensors: dict[str, torch.Tensor],
+        batch_size: int = 32,
+    ) -> dict[str, Any]:
+        """Sample a random minibatch from the 3,000-layout localization dataset."""
+        n = len(loc_tensors["task_id"])
+        idx = torch.randint(0, n, (batch_size,))
+        obs: dict[str, torch.Tensor] = {
+            "proprio": loc_tensors["proprio"][idx].to(self.device, non_blocking=True),
+        }
+        for cam in CAMERA_NAMES:
+            obs[f"rgb_{cam}"] = (
+                loc_tensors[f"rgb_{cam}"][idx]
+                .to(self.device, non_blocking=True)
+                .float()
+                .div_(255.0)
+            )
+        return {
+            "obs": obs,
+            "task_id": loc_tensors["task_id"][idx].to(self.device, non_blocking=True),
+            "obj_xy": loc_tensors["obj_xy"][idx].to(self.device, non_blocking=True),
+        }
+
     def train(self, verbose: bool = True) -> dict[str, Any]:
         """Run full training schedule and persist best + latest checkpoints."""
         save_dir = Path(self.config.save_dir)
@@ -138,6 +187,35 @@ class PolicyTrainer:
                 f"K={self.config.num_flow_samples} | LR={self.config.effective_lr:.1e}"
             )
 
+        pretrain_loc_summary: dict[str, Any] | None = None
+        loc_replay_tensors: dict[str, torch.Tensor] | None = None
+        if (
+            self.config.train_mode == "sim_only"
+            and self.config.pretrain_loc_steps > 0
+        ):
+            pretrain_loc_summary = pretrain_vision_encoders(
+                policy=self.policy,
+                loc_npz_path=self.config.loc_data_path,
+                demo_h5_path=self.config.sim_data_path,
+                steps=self.config.pretrain_loc_steps,
+                batch_size=64,
+                lr=1e-3,
+                device=self.device,
+                save_path=save_dir / "pretrained_vision.pt",
+            )
+            loc_replay_tensors = self._load_loc_replay_tensors()
+            # Re-initialize Stage 2 AdamW optimizer after Stage 1 pretraining
+            self.optimizer = torch.optim.AdamW(
+                self.policy.parameters(),
+                lr=self.config.effective_lr,
+                weight_decay=self.config.weight_decay,
+            )
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(self.config.epochs, 1),
+                eta_min=self.config.effective_lr * 0.05,
+            )
+
         best_val_mse = float("inf")
         best_loss = float("inf")
         history: list[dict[str, float]] = []
@@ -152,12 +230,18 @@ class PolicyTrainer:
 
             # Accumulate detached 0-D tensors on device to prevent per-batch CPU-GPU syncs
             loss_sum = torch.zeros((), device=self.device, dtype=torch.float32)
+            cfm_sum = torch.zeros((), device=self.device, dtype=torch.float32)
+            aux_pos_sum = torch.zeros((), device=self.device, dtype=torch.float32)
             arm_sum = torch.zeros((), device=self.device, dtype=torch.float32)
             grip_sum = torch.zeros((), device=self.device, dtype=torch.float32)
             vnorm_sum = torch.zeros((), device=self.device, dtype=torch.float32)
             num_batches = 0
 
             for batch in self.loader.iter_epoch(epoch=epoch):
+                if loc_replay_tensors is not None and self.config.aux_pos_loss_weight > 0.0:
+                    batch["loc_replay"] = self._sample_loc_replay_batch(
+                        loc_replay_tensors, batch_size=32
+                    )
                 self.optimizer.zero_grad(set_to_none=True)
                 out = self.flow_matcher.compute_loss(self.policy, batch)
                 loss = out["loss"]
@@ -169,6 +253,10 @@ class PolicyTrainer:
                 self.optimizer.step()
 
                 loss_sum = loss_sum + loss.detach()
+                cfm_sum = cfm_sum + out.get("cfm_loss", loss.detach())
+                aux_pos_sum = aux_pos_sum + out.get(
+                    "aux_pos_loss", torch.zeros((), device=self.device)
+                )
                 arm_sum = arm_sum + out["arm_mse"]
                 grip_sum = grip_sum + out["gripper_mse"]
                 vnorm_sum = vnorm_sum + out["v_norm"]
@@ -182,6 +270,8 @@ class PolicyTrainer:
             ep_metrics = {
                 "epoch": float(epoch),
                 "loss": float((loss_sum / denom).item()),
+                "cfm_loss": float((cfm_sum / denom).item()),
+                "aux_pos_loss": float((aux_pos_sum / denom).item()),
                 "arm_mse": float((arm_sum / denom).item()),
                 "gripper_mse": float((grip_sum / denom).item()),
                 "v_norm": float((vnorm_sum / denom).item()),
@@ -214,13 +304,32 @@ class PolicyTrainer:
                 print(
                     f"[Epoch {epoch:02d}/{self.config.epochs:02d}] "
                     f"loss={ep_metrics['loss']:.5f} "
-                    f"(arm={ep_metrics['arm_mse']:.5f}, grip={ep_metrics['gripper_mse']:.5f}) | "
+                    f"(cfm={ep_metrics['cfm_loss']:.5f}, pos={ep_metrics['aux_pos_loss']:.5f}, "
+                    f"arm={ep_metrics['arm_mse']:.5f}, grip={ep_metrics['gripper_mse']:.5f}) | "
                     f"val_ode_mse={val_chunk_mse:.5f} | "
-                    f"lr={ep_metrics['lr']:.2e} | time={ep_metrics['epoch_time_s']:.2f}s"
+                    f"lr={ep_metrics['lr']:.2e} | time={ep_metrics['epoch_time_s']:.2f}s",
+                    flush=True,
+                )
+
+        final_loc: dict[str, Any] | None = None
+        if (
+            self.config.train_mode == "sim_only"
+            and self.config.pretrain_loc_steps > 0
+            and Path(self.config.sim_data_path).exists()
+        ):
+            val_data = load_demo_frame0_validation(self.config.sim_data_path)
+            final_loc = evaluate_policy_localization(self.policy, val_data, self.device)
+            if verbose:
+                ov = final_loc["overhead_cam"]
+                fu = final_loc["fused"]
+                print(
+                    f"[PostTrainLoc] ov_src={ov['src_err_cm']:.2f}cm (tgt={ov['tgt_err_cm']:.2f}cm, all4={ov['all4_err_cm']:.2f}cm, R2={ov['r2_src_xy'][0]:+.2f},{ov['r2_src_xy'][1]:+.2f}) | "
+                    f"fused_src={fu['src_err_cm']:.2f}cm (all4={fu['all4_err_cm']:.2f}cm)",
+                    flush=True,
                 )
 
         total_time_s = float(time.perf_counter() - t_start)
-        summary = {
+        summary: dict[str, Any] = {
             "train_mode": self.config.train_mode,
             "best_loss": float(best_loss),
             "best_val_chunk_mse": float(best_val_mse),
@@ -229,6 +338,8 @@ class PolicyTrainer:
             "save_dir": str(save_dir),
             "best_checkpoint": str(save_dir / "best_policy.pt"),
             "latest_checkpoint": str(save_dir / "latest_policy.pt"),
+            "pretrain_localization": pretrain_loc_summary,
+            "final_localization": final_loc,
             "history": history,
         }
         (save_dir / "training_history.json").write_text(json.dumps(summary, indent=2) + "\n")
