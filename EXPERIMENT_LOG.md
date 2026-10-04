@@ -16,7 +16,8 @@ Each experiment follows four sections:
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
 | **Exp 01 (`exp01_clean_lags32`)** | Clean baseline with complete 8-segment trajectories and 5-frame joint history | Kept all release/retract frames, removed time-index hacks, added `30D` history `lags=(0,4,8,16,32)`, `max_steps=280` | `0 / 60` (`0.0%`) | `1 / 60` (`1.7%`) | `2 / 60` (`3.3%`) | `0.10` (blind; `overhead_cam` $R^2 \le 0.00$) | Carry, release, and retract work end-to-end (`test_t0_s9013`), but the policy copies joint velocity history and ignores the cameras |
 | **Exp 02a (`exp02a_sharp_nohist`)** | Un-blind the camera encoder and remove the joint velocity copycat shortcut | `16x16` spatial grid (`conv4` stride 1), removed pre-softmax `SiLU`, `temp=0.1`, single-frame `lags=(0,)` (`6D`) | `0 / 60` (`0.0%`) | `1 / 60` (`1.7%`) | `6 / 60` (`10.0%`) | `0.34` (`3.4x` higher; `overhead_cam` pan $R^2 = +0.66$) | Vision is active and test lifts tripled (`2/60 -> 6/60`), but 300 demos are too few to learn accurate forward reach depth (`shoulder` $R^2 = +0.02$) |
-| **Exp 02b (`exp02b_pretrain_loc`)** | Teach the camera encoders exact 2D object positions before and during policy training | Stage 1 pretraining on `3,000` labeled layouts + 4 parallel training-only `12D` position heads co-supervised in Stage 2 (`w=0.5`) | **`9 / 60` (`15.0%`)** | **`5 / 60` (`8.3%`)** | **`30 / 60` (`50.0%`)** | **`0.89` (loc error `0.55 to 0.62 cm`; `overhead_cam` pan $R^2 = +0.96$)** | **Localization is now solved (`107/120` reach `< 2 cm`, `65/120` lift `> 2 cm`, `14/120` strict pass); remaining losses are at grasp-to-lift (`42` eps) and lift-to-pass (`51` eps), i.e. contact and release, not perception** |
+| **Exp 02b (`exp02b_pretrain_loc`)** | Teach the camera encoders exact 2D object positions before and during policy training | Stage 1 pretraining on `3,000` labeled layouts + 4 parallel training-only `12D` position heads co-supervised in Stage 2 (`w=0.5`) | `9 / 60` (`15.0%`) | `5 / 60` (`8.3%`) | `30 / 60` (`50.0%`) | `0.89` (loc error `0.55 to 0.62 cm`; `overhead_cam` pan $R^2 = +0.96$) | Localization is solved (`107/120` reach `< 2 cm`, `65/120` lift `> 2 cm`, `14/120` strict pass), but `MultiCameraAttention` overfits on `300` demos |
+| **Exp 02c (`exp02c_no_attn`)** | Remove `MultiCameraAttention` and `aux_fused_pos_head` so camera tokens enter `z_fused` directly without mixing distortion | Deleted `MultiCameraAttention` & `aux_fused_pos_head` (`-33,696` params); direct `96D` concat `[tok_tp, tok_ov, tok_wr]`; strictly vision-only Stage 1 | **`11 / 60` (`18.3%`)** | **`16 / 60` (`26.7%`)** | **`40 / 60` (`66.7%`)** | **Loc error `0.56 cm` (`tp`), `0.72 cm` (`ov`, tgt `0.49 cm`), `1.90 cm` (`wr`)** | **Test strict pass more than tripled (`5/60 -> 16/60`) and combined strict pass nearly doubled (`14/120 -> 27/120 = 22.5%`, `75/120 = 62.5%` lift `> 2 cm`)** |
 
 ***
 
@@ -124,7 +125,57 @@ In Experiment 02a, `300` demonstrations were not enough distinct tabletop scenes
   3. **Lifted above `2.0 cm`**: **`65 / 120` (`54.2%`)** (**`42` episodes lost at grasp-to-lift**: the gripper reaches the object within `< 2 cm` but slips off the rim, closes slightly early/late, or stalls during clamp)
   4. **Strict Pass**: **`14 / 120` (`11.7%`)** (**`51` episodes lost at lift-to-pass**: the robot lifts and carries the object toward the goal, but misses the receptacle rim, drops slightly off-center on the cube, or nudges a bystander/target object during placement and release)
 
-  In short, **localization is solved, and the remaining `93` post-reach losses (`42` at grasp-to-lift and `51` at lift-to-pass) are contact, grasp closure, and release precision issues, not perception**.
+### 4. What to Try Next
+1. **Experiment 02c (Remove `MultiCameraAttention` & `aux_fused_pos_head`)**: In `Exp 02b`, `MultiCameraAttention` used a frozen random `ProprioMLP` during Stage 1 and then re-learned joint-conditioned attention weights on only `300` demos in Stage 2, creating a `9/60` (`15.0%`) vs. `5/60` (`8.3%`) train-to-test gap. Test removing `MultiCameraAttention` and `aux_fused_pos_head` entirely so the 3 camera tokens (`[tok_tp, tok_ov, tok_wr] = 96D`) enter `z_fused` directly without attention mixing.
+
+***
+
+## Experiment 02c: Direct Camera Token Concatenation Without Attention (`exp02c_no_attn`)
+
+* **Commit / Checkpoint**: `f728d47` | `checkpoints/exp02c_no_attn/best_policy.pt`
+
+### 1. Hypothesis
+In `Exp 02b`, each camera encoder (`SpatialSoftmaxConvNet`) already produced a clean `32D` spatial token with `0.55 to 0.60 cm` localization accuracy, but passing those three tokens through `MultiCameraAttention(query=cat(z_prop, z_task))` before `z_fused` introduced unnecessary query-key-value mixing conditioned on `z_prop` (`64D`). Worse, during Stage 1 pretraining, `ProprioMLP` was frozen at random initialization while `MultiCameraAttention` was trained through `aux_fused_pos_head`, and then in Stage 2 `ProprioMLP` started training from scratch, shifting the attention query distribution across the `300` demonstrations. We hypothesized that **deleting `MultiCameraAttention` and `aux_fused_pos_head` completely** and concatenating `[tok_third_person, tok_overhead, tok_wrist]` (`96D`) directly into `z_fused` (`192D`) would eliminate attention overfitting and improve held-out test generalization.
+
+### 2. Changes
+* **Model ([`training/model.py`](./training/model.py), [`training/__init__.py`](./training/__init__.py))**:
+  - Deleted `MultiCameraAttention` (`15,616` parameters) and `aux_fused_pos_head` (`18,080` parameters), reducing total trainable parameters by **`33,696` (`-3.1%`)** from `1,089,735` to **`1,056,039`** (`1,026,435` active at inference).
+  - Updated [`extract_obs_features`](./training/model.py) to concatenate `[tok_third_person, tok_overhead, tok_wrist]` (`96D`) directly with `z_prop` (`64D`) and `z_task` (`32D`) to form `z_fused` (`192D`), keeping `wrist_cam_drop_prob = 0.05` on slice `[64:96]` during training.
+  - Added vision-only [`encode_vision_tokens`](./training/model.py) so Stage 1 pretraining and localization evaluation never touch `proprio` or `proprio_mlp`.
+* **Stage 1 & Stage 2 Losses ([`training/pretrain_vision.py`](./training/pretrain_vision.py), [`training/flow_matching.py`](./training/flow_matching.py))**:
+  - Stage 1 pretraining optimizes strictly `task_embedding + camera_encoders + aux_cam_pos_heads` with loss `1.0 * MSE(overhead) + 1.0 * MSE(third_person) + 0.5 * MSE(wrist)`.
+  - Stage 2 auxiliary position loss averages the 3 per-camera heads (`overhead = 1.0`, `third_person = 1.0`, `wrist = 0.25`, `w_total = 2.25`) across `0.5 * demo_pos_loss + 0.5 * loc_replay_loss`.
+  - All training hyperparameters (`seed = 42`, `epochs = 20`, `batch_size = 128`, `lr = 5e-4`, `val_ode_mse` selection) remained identical to `Exp 02b`.
+
+### 3. Results
+
+| Split / Metric | Exp 02b (With Camera Attention) | **Exp 02c (No Camera Attention)** | Change (`Exp 02b -> Exp 02c`) |
+| :--- | :---: | :---: | :---: |
+| **Trainable / Inference Parameters** | `1,089,735` / `1,042,051` | **`1,056,039` / `1,026,435`** | **`-33,696` (`-3.1%`)** |
+| **Stage 1 Loc Error (`ov_src` / `tp_src` / `wr_src`)** | `0.70 cm` / `0.71 cm` / `2.10 cm` | **`0.78 cm` / `0.74 cm` / `2.23 cm`** | Comparable (`all4 = 0.67 cm`, $R^2 = +0.98, +0.99$) |
+| **Post-Stage-2 Loc Error (`ov_src` / `tp_src` / `wr_src`)** | `0.60 cm` / `0.55 cm` / `2.12 cm` | **`0.72 cm` / `0.56 cm` / `1.90 cm`** | Wrist improved `-0.22 cm` (`all4 = 0.57 cm`, $R^2 = +0.99, +1.00$) |
+| **Validation ODE Action MSE (`val_ode_mse`)** | `0.00222` | **`0.00221`** | `-0.00001` |
+| **Train Strict Pass (`60` eps)** | `9 / 60 (15.0%)` | **`11 / 60 (18.3%)`** | **`+3.3%` (`+2` eps)** |
+| Train Task 0 (`pick_pen_holder_to_bowl`) | `3 / 20 (15.0%)` | **`4 / 20 (20.0%)`** | `+5.0%` |
+| Train Task 1 (`pick_cup_to_bowl`) | `3 / 20 (15.0%)` | **`6 / 20 (30.0%)`** | `+15.0%` |
+| Train Task 2 (`stack_cup_on_cube`) | `3 / 20 (15.0%)` | `1 / 20 (5.0%)` | `-10.0%` |
+| **Test Strict Pass (`60` eps)** | `5 / 60 (8.3%)` | **`16 / 60 (26.7%)`** | **`+18.4%` (`+11` eps, `3.2x` higher)** |
+| Test Task 0 (`pick_pen_holder_to_bowl`) | `3 / 20 (15.0%)` | **`7 / 20 (35.0%)`** | `+20.0%` |
+| Test Task 1 (`pick_cup_to_bowl`) | `1 / 20 (5.0%)` | **`7 / 20 (35.0%)`** | `+30.0%` |
+| Test Task 2 (`stack_cup_on_cube`) | `1 / 20 (5.0%)` | **`2 / 20 (10.0%)`** | `+5.0%` |
+| **Combined Strict Pass (`120` eps)** | `14 / 120 (11.7%)` | **`27 / 120 (22.5%)`** | **`+10.8%` (`+13` eps, `1.93x` higher)** |
+| **Combined Reach `< 2.0 cm` (`120` eps)** | `107 / 120 (89.2%)` (`0.79 cm`) | **`105 / 120 (87.5%)`** (`0.85 cm`) | `-1.7%` |
+| **Combined Lift `> 2.0 cm` (`120` eps)** | `65 / 120 (54.2%)` (`+5.46 cm`) | **`75 / 120 (62.5%)`** (`+7.24 cm`) | **`+8.3%` (`+10` eps, `+1.78 cm` mean lift)** |
+
+* **What worked**:
+  - **Held-out test strict pass rate more than tripled** from `5/60 (8.3%)` to **`16/60 (26.7%)`** (`7/20` on Task 0, `7/20` on Task 1, `2/20` on Task 2), and **combined strict pass rate nearly doubled** from `14/120 (11.7%)` to **`27/120 (22.5%)`**.
+  - **Grasp-to-lift conversion improved significantly**: Combined episodes lifting the object `> 2.0 cm` rose from `65/120 (54.2%)` to **`75/120 (62.5%)`** (`40/60 = 66.7%` on held-out test seeds), and mean max lift increased from `+5.46 cm` to **`+7.24 cm`** (`+7.68 cm` on test).
+  - **Simpler, cleaner architecture**: Removing `MultiCameraAttention` eliminated the Stage 1 -> Stage 2 query distribution shift and preserved each camera's `32D` token in its own dedicated slot (`[0:32]`, `[32:64]`, `[64:96]`).
+* **Execution Funnel Analysis (`120` Episodes)**:
+  - **Exp 02b Funnel**: `120` total $\to$ `107 (89.2%)` reach `< 2 cm` (`-13` missed reach) $\to$ `65 (54.2%)` lift `> 2 cm` (`-42` lost at grasp-to-lift) $\to$ `14 (11.7%)` strict pass (`-51` lost at lift-to-pass).
+  - **Exp 02c Funnel**: `120` total $\to$ **`105 (87.5%)` reach `< 2 cm`** (`-15` missed reach) $\to$ **`75 (62.5%)` lift `> 2 cm`** (`-30` lost at grasp-to-lift, cutting grasp failures by `29%`) $\to$ **`27 (22.5%)` strict pass** (`-48` lost at lift-to-pass; `28/120` achieved `task_success`, with `1` episode disqualified for nudging the target by `2.0 cm`).
+  - Crucially, among the `48` episodes in `Exp 02c` that lifted `> 2 cm` but failed strict pass, **`17` episodes** carried the source object all the way over the target receptacle (`final_src_tgt_xy = 0.67 to 2.29 cm`, with `+9.8 to +13.8 cm` lift), failing only at final release timing or rim contact.
 
 ### 4. What to Try Next
-1. **Target the two post-reach bottlenecks (`42` grasp-to-lift losses and `51` lift-to-pass losses)**: Improve fine contact timing, wrist-camera guided grasp alignment, and placement/release trajectories while preserving the Stage 1 + Stage 2 localization pipeline.
+1. **Target the remaining post-reach bottlenecks (`30` grasp-to-lift losses and `48` lift-to-pass losses, including the `17` near-target release misses)**: Improve fine grasp closure and target placement/release precision on top of the simplified `Exp 02c` architecture.
+
