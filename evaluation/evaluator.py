@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ import torch
 from envs.base import CAMERA_NAMES, TASK_SPECS
 from envs.sim_env import SimEnv
 from evaluation.visualizer import RolloutVisualizer
-from training.dataset import build_action_chunks
+from training.dataset import build_action_chunks, build_proprio_history_step
 from training.flow_matching import ConditionalFlowMatcher, TemporalEnsembler
 from training.trainer import load_policy_checkpoint
 
@@ -125,7 +126,7 @@ class SimPolicyEvaluator:
         episode_label: str | None = None,
         gt_proprio: np.ndarray | None = None,
         gt_actions: np.ndarray | None = None,
-        max_steps: int = 154,
+        max_steps: int = 280,
         ode_steps: int | None = None,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
@@ -170,43 +171,48 @@ class SimPolicyEvaluator:
         cached_kp: dict[str, np.ndarray] = {}
         cached_weights: np.ndarray = np.full((len(CAMERA_NAMES),), 1.0 / len(CAMERA_NAMES), dtype=np.float32)
         prop_history: list[np.ndarray] = []
-        has_clamped = False
         lags = self.config.proprio_history_lags
+        passed_constraints: dict[str, Any] | None = None
 
         for step in range(max_steps):
             prop_cur = obs["proprio"].astype(np.float32).copy()
-            if prop_cur[5] < 0.56:
-                has_clamped = True
-            if not has_clamped and prop_cur[5] >= 0.58:
-                prop_cur[5] = 0.68
             prop_history.append(prop_cur)
 
             need_query = use_temporal_ensemble or cached_chunk is None or (step % max(1, exec_horizon) == 0)
             if need_query:
-                cur_t = len(prop_history) - 1
-                prop_hist_np = np.stack(
-                    [prop_history[max(0, cur_t - int(lag))] for lag in lags],
-                    axis=0,
+                prop_hist_np = build_proprio_history_step(
+                    prop_history, len(prop_history) - 1, lags=lags
                 )
                 obs_t = self._prepare_obs_tensors(obs, proprio_history=prop_hist_np)
                 torch.manual_seed(int(seed) * 1000 + step)
                 t0 = time.perf_counter()
-                chunk_t, aux = self.matcher.sample_action_chunk(
-                    self.policy,
-                    obs_t,
-                    task_id=int(task_id),
-                    ode_steps=steps_ode,
-                    clip_to_limits=True,
-                    return_aux=True,
-                )
+                if save_gif:
+                    chunk_t, aux = self.matcher.sample_action_chunk(
+                        self.policy,
+                        obs_t,
+                        task_id=int(task_id),
+                        ode_steps=steps_ode,
+                        clip_to_limits=True,
+                        return_aux=True,
+                    )
+                    cached_kp = {
+                        cam: kp_t[0].detach().cpu().numpy()
+                        for cam, kp_t in aux["keypoints"].items()
+                    }
+                    cached_weights = aux["camera_weights"][0].detach().cpu().numpy()
+                else:
+                    chunk_t = self.matcher.sample_action_chunk(
+                        self.policy,
+                        obs_t,
+                        task_id=int(task_id),
+                        ode_steps=steps_ode,
+                        clip_to_limits=True,
+                        return_aux=False,
+                    )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 latencies_ms.append(latency_ms)
+                assert isinstance(chunk_t, torch.Tensor)
                 cached_chunk = chunk_t[0].detach().cpu().numpy()
-                cached_kp = {
-                    cam: kp_t[0].detach().cpu().numpy()
-                    for cam, kp_t in aux["keypoints"].items()
-                }
-                cached_weights = aux["camera_weights"][0].detach().cpu().numpy()
             else:
                 latency_ms = latencies_ms[-1] if latencies_ms else 0.0
 
@@ -229,13 +235,15 @@ class SimPolicyEvaluator:
             min_pinch_src_xy_cm = min(min_pinch_src_xy_cm, cur_pinch_src_xy_cm)
             max_src_z_cm = max(max_src_z_cm, cur_src_z_cm)
 
+            cur_constraints = self.env.check_constraints(int(task_id))
+            cur_succ = bool(cur_constraints["all_constraints_passed"])
+
             if save_gif:
                 gt_idx = min(step, len(gt_proprio) - 1) if gt_proprio is not None else 0
                 cur_gt_prop = gt_proprio[gt_idx] if gt_proprio is not None else None
                 cur_gt_chunk = gt_chunks[gt_idx] if gt_chunks is not None else None
-                cur_succ = self.env.check_task_success(int(task_id))
                 live_status = (
-                    "PASS: Goal satisfied"
+                    "PASS: Goal & constraints satisfied"
                     if cur_succ
                     else f"IN PROGRESS (min_src_xy={min_pinch_src_xy_cm:.1f}cm)"
                 )
@@ -262,9 +270,21 @@ class SimPolicyEvaluator:
                     latency_ms=latency_ms,
                 )
 
-            obs = self.env.step(action_6d)
+            if cur_succ:
+                passed_constraints = cur_constraints
+                break
 
-        constraints = self.env.check_constraints(int(task_id))
+            obs = self.env.step(action_6d)
+            post_constraints = self.env.check_constraints(int(task_id))
+            if bool(post_constraints["all_constraints_passed"]):
+                passed_constraints = post_constraints
+                break
+
+        constraints = (
+            passed_constraints
+            if passed_constraints is not None
+            else self.env.check_constraints(int(task_id))
+        )
         src_pos_end = self.env.data.body(src_bid).xpos
         tgt_pos_end = self.env.data.body(tgt_bid).xpos
         final_src_tgt_xy_cm = float(np.linalg.norm(src_pos_end[:2] - tgt_pos_end[:2])) * 100.0
@@ -324,7 +344,7 @@ class SimPolicyEvaluator:
         demo_key: str = "demo_0000",
         h5_path: str | Path = "data/sim_demos.h5",
         *,
-        max_steps: int = 154,
+        max_steps: int = 280,
         ode_steps: int | None = None,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
@@ -364,3 +384,125 @@ class SimPolicyEvaluator:
             fps=fps,
             frame_stride=frame_stride,
         )
+
+    def evaluate_benchmark(
+        self,
+        *,
+        episodes_per_task: int = 20,
+        train_h5_path: str | Path = "data/sim_demos.h5",
+        test_base_seed: int = 90000,
+        domain_rand: bool = False,
+        max_steps: int = 280,
+        ode_steps: int | None = None,
+        exec_horizon: int = 1,
+        use_temporal_ensemble: bool = True,
+        save_report_path: str | Path | None = None,
+        verbose: bool = True,
+    ) -> dict[str, Any]:
+        """Run strict evaluation on both training seeds and held-out test seeds (>=20 per task)."""
+        n_per_task = max(1, int(episodes_per_task))
+        bench_ode_steps = int(ode_steps if ode_steps is not None else 5)
+        train_seeds_by_task: dict[int, list[int]] = {0: [], 1: [], 2: []}
+        target_dom = "sim_dr" if domain_rand else "sim_clean"
+
+        h5_file = Path(train_h5_path)
+        if h5_file.exists():
+            with h5py.File(h5_file, "r") as f:
+                root = f.get("data", f)
+                for k in sorted(k for k in root if k.startswith("demo_")):
+                    grp = root[k]
+                    tid = int(grp.attrs.get("task_id", 0))
+                    dom = str(grp.attrs.get("domain", "sim_clean"))
+                    seed_val = int(grp.attrs.get("seed", 1000))
+                    if dom == target_dom and len(train_seeds_by_task[tid]) < n_per_task:
+                        train_seeds_by_task[tid].append(seed_val)
+
+        for tid in range(3):
+            while len(train_seeds_by_task[tid]) < n_per_task:
+                idx = len(train_seeds_by_task[tid])
+                base = (1500 if domain_rand else 1000) + tid * 10000 + idx
+                train_seeds_by_task[tid].append(base)
+
+        def _run_split(split_name: str, seeds_map: dict[int, list[int]]) -> dict[str, Any]:
+            all_eps: list[EpisodeEvalResult] = []
+            per_task: dict[int, dict[str, Any]] = {}
+            if verbose:
+                print(
+                    f"\n=== [{split_name.upper()} SPLIT] ({n_per_task} seeds/task, "
+                    f"domain={target_dom}, strict all_constraints_passed) ==="
+                )
+            for tid in range(3):
+                t_eps: list[EpisodeEvalResult] = []
+                for s in seeds_map[tid]:
+                    res = self.run_episode(
+                        task_id=tid,
+                        seed=s,
+                        domain_rand=domain_rand,
+                        episode_label=f"{split_name}_t{tid}_s{s}",
+                        max_steps=max_steps,
+                        ode_steps=bench_ode_steps,
+                        exec_horizon=exec_horizon,
+                        use_temporal_ensemble=use_temporal_ensemble,
+                        save_gif=False,
+                        save_strip=False,
+                    )
+                    t_eps.append(res)
+                    all_eps.append(res)
+                passed = sum(1 for r in t_eps if r.all_constraints_passed)
+                total = len(t_eps)
+                rate = passed / float(max(total, 1))
+                per_task[tid] = {
+                    "passed": passed,
+                    "total": total,
+                    "strict_success_rate": rate,
+                    "mean_min_src_xy_cm": float(np.mean([r.min_pinch_src_xy_cm for r in t_eps])),
+                    "mean_max_lift_cm": float(np.mean([r.max_src_lift_cm for r in t_eps])),
+                    "mean_final_tgt_xy_cm": float(np.mean([r.final_src_tgt_xy_cm for r in t_eps])),
+                }
+                if verbose:
+                    print(
+                        f"  Task {tid} ({TASK_SPECS[tid].name}): "
+                        f"{passed}/{total} ({rate * 100.0:.1f}%) | "
+                        f"mean_src_xy={per_task[tid]['mean_min_src_xy_cm']:.2f}cm | "
+                        f"mean_lift=+{per_task[tid]['mean_max_lift_cm']:.2f}cm | "
+                        f"mean_tgt_xy={per_task[tid]['mean_final_tgt_xy_cm']:.2f}cm"
+                    )
+            tot_passed = sum(1 for r in all_eps if r.all_constraints_passed)
+            tot_count = len(all_eps)
+            tot_rate = tot_passed / float(max(tot_count, 1))
+            if verbose:
+                print(
+                    f"--> {split_name.upper()} STRICT PASS TOTAL: "
+                    f"{tot_passed}/{tot_count} ({tot_rate * 100.0:.1f}%)"
+                )
+            return {
+                "passed": tot_passed,
+                "total": tot_count,
+                "strict_success_rate": tot_rate,
+                "per_task": per_task,
+                "episodes": [r.to_dict() for r in all_eps],
+            }
+
+        test_seeds_by_task = {
+            tid: [int(test_base_seed) + tid * 10000 + i for i in range(n_per_task)]
+            for tid in range(3)
+        }
+
+        train_summary = _run_split("train", train_seeds_by_task)
+        test_summary = _run_split("test", test_seeds_by_task)
+
+        report = {
+            "checkpoint": str(self.checkpoint_path),
+            "domain": target_dom,
+            "episodes_per_task": n_per_task,
+            "train_split": train_summary,
+            "test_split": test_summary,
+        }
+        out_report = (
+            Path(save_report_path)
+            if save_report_path is not None
+            else self.checkpoint_path.parent / f"eval_benchmark_{target_dom}.json"
+        )
+        out_report.parent.mkdir(parents=True, exist_ok=True)
+        out_report.write_text(json.dumps(report, indent=2) + "\n")
+        return report

@@ -34,7 +34,7 @@ class AlloyTrainConfig:
     camera_names: tuple[str, ...] = CAMERA_NAMES
     img_size: int = 128
     proprio_dim: int = 6
-    proprio_history_lags: tuple[int, ...] = (0, 4, 8)
+    proprio_history_lags: tuple[int, ...] = (0, 4, 8, 16, 32)
     action_dim: int = 6
     chunk_size: int = 16
     num_tasks: int = NUM_TASKS
@@ -55,11 +55,10 @@ class AlloyTrainConfig:
     shift_pad: int = 4
     dropout: float = 0.05
     keypoint_noise: float = 0.01
-    proprio_noise_std: float = 0.05
-    pan_noise_std: float = 0.25
-    proprio_drop_prob: float = 0.20
-    wrist_cam_drop_prob: float = 0.10
-    home_anchor_prob: float = 0.65
+    proprio_noise_std: float = 0.02
+    proprio_drop_prob: float = 0.10
+    wrist_cam_drop_prob: float = 0.05
+    val_samples_per_epoch: int = 512
 
     # Optimization schedule
     batch_size: int = 128

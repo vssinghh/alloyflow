@@ -153,6 +153,34 @@ class ConditionalFlowMatcher:
             if was_training:
                 policy.train()
 
+    @torch.no_grad()
+    def compute_eval_chunk_mse(
+        self,
+        policy: TaskConditionedVisionFlowPolicy,
+        batch: dict[str, Any],
+    ) -> float:
+        """Evaluate deterministic ODE action-chunk MSE in policy.eval() mode for checkpoint selection."""
+        target_actions = batch["actions"]
+        device = target_actions.device
+        rng_state = torch.get_rng_state()
+        try:
+            torch.manual_seed(self.config.seed + 777)
+            pred_actions = self.sample_action_chunk(
+                policy,
+                batch["obs"],
+                batch["task_id"],
+                ode_steps=self.config.ode_steps,
+                clip_to_limits=True,
+                return_aux=False,
+            )
+            assert isinstance(pred_actions, torch.Tensor)
+            sq_err = (pred_actions - target_actions).pow(2)
+            dim_w = self._dim_weights.to(device=device).view(1, 1, -1)
+            weighted_mse = (torch.sum(sq_err * dim_w, dim=-1) / torch.sum(dim_w)).mean()
+            return float(weighted_mse.item())
+        finally:
+            torch.set_rng_state(rng_state)
+
 
 class TemporalEnsembler:
     """Exponential sliding-window action chunk blender for 20 Hz closed-loop control."""

@@ -57,7 +57,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=154,
+        default=280,
         help="Maximum control steps per episode.",
     )
     parser.add_argument(
@@ -87,6 +87,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=str,
         default="checkpoints/eval_gifs",
         help="Output directory for diagnostic GIFs and keyframe strips.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run strict benchmark evaluation (>=20 seeds/task) on both training and test splits.",
     )
     parser.add_argument(
         "--device",
@@ -123,6 +128,19 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
     )
     results: list[EpisodeEvalResult] = []
     try:
+        if args.benchmark:
+            n_eps = max(args.episodes, 20)
+            evaluator.evaluate_benchmark(
+                episodes_per_task=n_eps,
+                train_h5_path=args.h5_path,
+                test_base_seed=9000,
+                domain_rand=args.dr,
+                max_steps=args.max_steps,
+                exec_horizon=args.exec_horizon,
+                use_temporal_ensemble=use_ensemble,
+                verbose=True,
+            )
+            return results
         if args.demos:
             demo_keys = [k.strip() for k in args.demos.split(",") if k.strip()]
             for key in demo_keys:

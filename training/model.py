@@ -413,31 +413,19 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
 
         q_hist_norm = self.normalize_proprio(prop_hist_raw)  # (B, K_hist, 6)
         q_curr = q_hist_norm[:, 0, :].clone()
-        dq_deltas: list[torch.Tensor] = []
-        for lag_i in range(1, cfg.num_proprio_frames):
-            dq = (q_hist_norm[:, 0, :] - q_hist_norm[:, lag_i, :]).clone()
-            # Zero horizontal pan velocity so history carries only vertical/gripper phase transitions
-            dq[:, 0] = 0.0
-            dq_deltas.append(dq)
+        dq_deltas: list[torch.Tensor] = [
+            (q_hist_norm[:, 0, :] - q_hist_norm[:, lag_i, :]).clone()
+            for lag_i in range(1, cfg.num_proprio_frames)
+        ]
 
-        if self.training:
-            if "anchor_home_pan" in obs:
-                anchor_mask = obs["anchor_home_pan"].bool()
-                home_pan_norm = (0.0 - self.proprio_mean[0]) / self.proprio_std[0]
-                q_curr[:, 0] = torch.where(anchor_mask, home_pan_norm, q_curr[:, 0])
-            if cfg.proprio_noise_std > 0.0:
-                q_curr = q_curr + torch.randn_like(q_curr) * cfg.proprio_noise_std
-                for i in range(len(dq_deltas)):
-                    dq_deltas[i] = (
-                        dq_deltas[i] + torch.randn_like(dq_deltas[i]) * cfg.proprio_noise_std
-                    )
-                    dq_deltas[i][:, 0] = 0.0
-            if cfg.pan_noise_std > 0.0:
-                q_curr[:, 0] = (
-                    q_curr[:, 0] + torch.randn_like(q_curr[:, 0]) * cfg.pan_noise_std
+        if self.training and cfg.proprio_noise_std > 0.0:
+            q_curr = q_curr + torch.randn_like(q_curr) * cfg.proprio_noise_std
+            for i in range(len(dq_deltas)):
+                dq_deltas[i] = (
+                    dq_deltas[i] + torch.randn_like(dq_deltas[i]) * cfg.proprio_noise_std
                 )
 
-        prop_feat_in = torch.cat([q_curr, *dq_deltas], dim=-1)  # (B, 18)
+        prop_feat_in = torch.cat([q_curr, *dq_deltas], dim=-1)
         z_prop = self.proprio_mlp(prop_feat_in)  # (B, 64)
         if self.training and cfg.proprio_drop_prob > 0.0:
             keep_prop = (

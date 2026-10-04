@@ -43,13 +43,9 @@ def filter_episode_frames(
     chunk_size: int = DEFAULT_TRAIN_CONFIG.chunk_size,
     trim_stationary: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Filter out grasp-clamp dwell, release-unclamp lag, and terminal hold-padded anchor frames.
+    """Filter out only truly motionless frames (arm still and gripper state/command unchanged).
 
-    Returns:
-        prop_anchors: (N_kept, 6) filtered anchor proprioception states.
-        act_anchors: (N_kept, 6) single-step actions at anchor states.
-        chunk_anchors: (N_kept, chunk_size, 6) unpadded forward-moving action chunks.
-        anchor_raw_indices: (N_kept,) integer indices into the raw episode arrays.
+    Preserves all grasp-closure, object-release, and post-placement retraction frames.
     """
     prop = np.asarray(proprio, dtype=np.float32).copy()
     act = np.asarray(actions, dtype=np.float32).copy()
@@ -61,22 +57,17 @@ def filter_episode_frames(
 
     dq = np.linalg.norm(np.diff(prop[:, :5], axis=0, append=prop[-1:, :5]), axis=-1)
     dg = np.abs(np.diff(prop[:, 5], axis=0, append=prop[-1:, 5]))
-    da_g = np.diff(act[:, 5], axis=0, prepend=act[:1, 5])
+    da = np.linalg.norm(np.diff(act, axis=0, append=act[-1:]), axis=-1)
 
-    # 1. Grasp clamp dwell: jaws blocked on rigid object (prop_g < 0.56, dg < 0.003) and arm slow (dq < 0.016)
-    clamp_dwell = (np.arange(t_len) > 0) & (prop[:, 5] < 0.56) & (dg < 0.003) & (dq < 0.016)
-    # 2. Release unclamp lag: command opening (da_g > 0.005) while still narrower than object (act_g <= prop_g + 0.02)
-    release_lag = (da_g > 0.005) & (act[:, 5] <= prop[:, 5] + 0.02)
-    # 3. Post-release bridge across pre-grasp open-gripper range [0.595, 0.718] in the second half of the episode
-    retract_bridge = (np.arange(t_len) > t_len // 2) & (prop[:, 5] > 0.595) & (prop[:, 5] < 0.718)
-
-    # 4. Hold open-air pre-grasp gripper constant at 0.68 so proprio[5] cannot act as a synthetic step timer
-    first_half = np.arange(t_len) < (t_len // 2)
-    prop[first_half & (prop[:, 5] >= 0.58), 5] = 0.68
-    act[first_half & (act[:, 5] >= 0.58), 5] = 0.68
-
-    keep_active = ~(clamp_dwell | release_lag | retract_bridge)
-    active_idx = np.where(keep_active)[0].astype(np.int64)
+    # Only trim truly motionless interior frames where arm, gripper state, and command are unchanged
+    motionless = (
+        (np.arange(t_len) > 0)
+        & (np.arange(t_len) < t_len - 1)
+        & (dq < 1e-3)
+        & (dg < 1e-3)
+        & (da < 1e-3)
+    )
+    active_idx = np.where(~motionless)[0].astype(np.int64)
     if len(active_idx) <= chunk_size:
         keep_idx = np.arange(t_len, dtype=np.int64)
         return prop, act, build_action_chunks(act, chunk_size=chunk_size), keep_idx
@@ -84,15 +75,21 @@ def filter_episode_frames(
     prop_act = prop[active_idx]
     act_act = act[active_idx]
     chunks_act = build_action_chunks(act_act, chunk_size=chunk_size)
+    return prop_act, act_act, chunks_act, active_idx
 
-    # 5. Exclude terminal hold-padded anchor steps so every anchor chunk has 100% real forward motion
-    anchor_len = max(1, len(act_act) - chunk_size + 1)
-    return (
-        prop_act[:anchor_len],
-        act_act[:anchor_len],
-        chunks_act[:anchor_len],
-        active_idx[:anchor_len],
-    )
+
+def build_proprio_history_step(
+    proprio_seq: np.ndarray | list[np.ndarray],
+    step_idx: int,
+    lags: tuple[int, ...] = DEFAULT_TRAIN_CONFIG.proprio_history_lags,
+) -> np.ndarray:
+    """Build (num_lags, 6) causal proprioception history for a single timestep (shared train/eval)."""
+    cur_t = int(step_idx)
+    frames = [
+        np.asarray(proprio_seq[max(0, cur_t - int(lag))], dtype=np.float32)
+        for lag in lags
+    ]
+    return np.stack(frames, axis=0).astype(np.float32)
 
 
 def build_proprio_history(
@@ -101,12 +98,7 @@ def build_proprio_history(
     lags: tuple[int, ...] = DEFAULT_TRAIN_CONFIG.proprio_history_lags,
 ) -> np.ndarray:
     """Build (N_kept, num_lags, 6) causal proprioception history from raw 20 Hz episode steps."""
-    prop = np.asarray(proprio_raw, dtype=np.float32).copy()
-    t_len = prop.shape[0]
-    if t_len > 32:
-        first_half = np.arange(t_len) < (t_len // 2)
-        prop[first_half & (prop[:, 5] >= 0.58), 5] = 0.68
-
+    prop = np.asarray(proprio_raw, dtype=np.float32)
     raw_idx = np.asarray(anchor_raw_indices, dtype=np.int64)
     frames = [prop[np.maximum(0, raw_idx - int(lag))] for lag in lags]
     return np.stack(frames, axis=1).astype(np.float32)
@@ -123,7 +115,6 @@ class HDF5DemoDataset:
         rolling_window_size: int = DEFAULT_TRAIN_CONFIG.rolling_window_size,
         trim_stationary: bool = True,
         proprio_history_lags: tuple[int, ...] = DEFAULT_TRAIN_CONFIG.proprio_history_lags,
-        home_anchor_prob: float = DEFAULT_TRAIN_CONFIG.home_anchor_prob,
     ) -> None:
         self.h5_path = Path(h5_path)
         if not self.h5_path.exists():
@@ -134,7 +125,6 @@ class HDF5DemoDataset:
         self.rolling_window_size = int(rolling_window_size)
         self.trim_stationary = bool(trim_stationary)
         self.proprio_history_lags = tuple(int(x) for x in proprio_history_lags)
-        self.home_anchor_prob = float(home_anchor_prob)
 
         with h5py.File(self.h5_path, "r") as f:
             root = f["data"] if "data" in f and isinstance(f["data"], h5py.Group) else f
@@ -293,27 +283,12 @@ class HDF5DemoDataset:
         actions_b = self.action_chunks[idx_cpu].to(device=device, non_blocking=True)
         task_id_b = self.task_ids[idx_cpu].to(device=device, non_blocking=True)
 
-        ep_step_cpu = self.ep_step[idx_cpu]
-        ep_start_cpu = self.ep_start_cursor[idx_cpu]
-        if self.home_anchor_prob > 0.0 and self.num_steps > 200:
-            is_pre_grasp = (ep_step_cpu > 0) & (ep_step_cpu < 32)
-            rand_draw = torch.rand(idx_cpu.shape, dtype=torch.float32)
-            anchor_mask = is_pre_grasp & (rand_draw < self.home_anchor_prob)
-            img_idx_cpu = torch.where(anchor_mask, ep_start_cpu, idx_cpu)
-            anchor_home_pan = (anchor_mask | (ep_step_cpu == 0)).to(
-                device=device, non_blocking=True
-            )
-        else:
-            img_idx_cpu = idx_cpu
-            anchor_home_pan = (ep_step_cpu == 0).to(device=device, non_blocking=True)
-
         obs_b: dict[str, torch.Tensor] = {
             "proprio": proprio_b,
             "proprio_history": proprio_hist_b,
-            "anchor_home_pan": anchor_home_pan,
         }
         for cam in self.camera_names:
-            img_u8 = self.rgb_cache[cam][img_idx_cpu].to(device=device, non_blocking=True)
+            img_u8 = self.rgb_cache[cam][idx_cpu].to(device=device, non_blocking=True)
             # Materialize contiguous NCHW while still 1-byte uint8 before float32 cast on Metal
             img_f32 = img_u8.permute(0, 3, 1, 2).contiguous().float().div_(255.0)
             obs_b[f"rgb_{cam}"] = img_f32
@@ -380,7 +355,6 @@ class MultiModeBatchLoader:
                 camera_names=config.camera_names,
                 rolling_window_size=config.rolling_window_size,
                 proprio_history_lags=config.proprio_history_lags,
-                home_anchor_prob=config.home_anchor_prob,
             )
             self.real_dataset = None
         elif self.mode in ("real_only", "finetune"):
@@ -391,7 +365,6 @@ class MultiModeBatchLoader:
                 camera_names=config.camera_names,
                 rolling_window_size=config.rolling_window_size,
                 proprio_history_lags=config.proprio_history_lags,
-                home_anchor_prob=config.home_anchor_prob,
             )
         elif self.mode == "cotrain":
             self.sim_dataset = sim_dataset or HDF5DemoDataset(
@@ -400,7 +373,6 @@ class MultiModeBatchLoader:
                 camera_names=config.camera_names,
                 rolling_window_size=config.rolling_window_size,
                 proprio_history_lags=config.proprio_history_lags,
-                home_anchor_prob=config.home_anchor_prob,
             )
             self.real_dataset = real_dataset or HDF5DemoDataset(
                 config.real_data_path,
@@ -408,7 +380,6 @@ class MultiModeBatchLoader:
                 camera_names=config.camera_names,
                 rolling_window_size=config.rolling_window_size,
                 proprio_history_lags=config.proprio_history_lags,
-                home_anchor_prob=config.home_anchor_prob,
             )
         else:
             raise ValueError(f"Unsupported train_mode: {self.mode}")
@@ -495,6 +466,15 @@ class MultiModeBatchLoader:
                 "task_id": torch.cat([sim_batch["task_id"], real_batch["task_id"]], dim=0),
                 "actions": torch.cat([sim_batch["actions"], real_batch["actions"]], dim=0),
             }
+
+    def get_validation_batch(self, num_samples: int = 512) -> dict[str, Any]:
+        """Return a deterministic, evenly spaced validation batch across all tasks and episodes."""
+        ds = self.sim_dataset if self.sim_dataset is not None else self.real_dataset
+        assert ds is not None
+        n_total = len(ds)
+        k = min(max(1, int(num_samples)), n_total)
+        val_idx = torch.linspace(0, n_total - 1, steps=k, dtype=torch.long)
+        return ds.get_batch(val_idx, device=self.device)
 
 
 def n_sim_complement(batch_size: int, n_real: int) -> int:

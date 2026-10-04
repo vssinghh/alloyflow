@@ -138,9 +138,13 @@ class PolicyTrainer:
                 f"K={self.config.num_flow_samples} | LR={self.config.effective_lr:.1e}"
             )
 
+        best_val_mse = float("inf")
         best_loss = float("inf")
         history: list[dict[str, float]] = []
         t_start = time.perf_counter()
+        val_batch = self.loader.get_validation_batch(
+            num_samples=self.config.val_samples_per_epoch
+        )
 
         for epoch in range(1, self.config.epochs + 1):
             ep_t0 = time.perf_counter()
@@ -172,16 +176,21 @@ class PolicyTrainer:
 
             self.scheduler.step()
             denom = float(max(num_batches, 1))
+            val_chunk_mse = self.flow_matcher.compute_eval_chunk_mse(
+                self.policy, val_batch
+            )
             ep_metrics = {
                 "epoch": float(epoch),
                 "loss": float((loss_sum / denom).item()),
                 "arm_mse": float((arm_sum / denom).item()),
                 "gripper_mse": float((grip_sum / denom).item()),
                 "v_norm": float((vnorm_sum / denom).item()),
+                "val_chunk_mse": float(val_chunk_mse),
                 "lr": float(self.optimizer.param_groups[0]["lr"]),
                 "epoch_time_s": float(time.perf_counter() - ep_t0),
             }
             history.append(ep_metrics)
+            best_loss = min(best_loss, ep_metrics["loss"])
 
             save_policy_checkpoint(
                 path=save_dir / "latest_policy.pt",
@@ -191,8 +200,8 @@ class PolicyTrainer:
                 metrics=ep_metrics,
                 optimizer=self.optimizer,
             )
-            if ep_metrics["loss"] < best_loss:
-                best_loss = ep_metrics["loss"]
+            if val_chunk_mse < best_val_mse:
+                best_val_mse = val_chunk_mse
                 save_policy_checkpoint(
                     path=save_dir / "best_policy.pt",
                     policy=self.policy,
@@ -206,6 +215,7 @@ class PolicyTrainer:
                     f"[Epoch {epoch:02d}/{self.config.epochs:02d}] "
                     f"loss={ep_metrics['loss']:.5f} "
                     f"(arm={ep_metrics['arm_mse']:.5f}, grip={ep_metrics['gripper_mse']:.5f}) | "
+                    f"val_ode_mse={val_chunk_mse:.5f} | "
                     f"lr={ep_metrics['lr']:.2e} | time={ep_metrics['epoch_time_s']:.2f}s"
                 )
 
@@ -213,6 +223,7 @@ class PolicyTrainer:
         summary = {
             "train_mode": self.config.train_mode,
             "best_loss": float(best_loss),
+            "best_val_chunk_mse": float(best_val_mse),
             "final_loss": float(history[-1]["loss"]) if history else float("nan"),
             "total_time_s": total_time_s,
             "save_dir": str(save_dir),
