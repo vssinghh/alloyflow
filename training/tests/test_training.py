@@ -18,7 +18,6 @@ from training.dataset import (
 )
 from training.flow_matching import ConditionalFlowMatcher, TemporalEnsembler
 from training.model import (
-    MultiCameraAttention,
     SpatialSoftmax2d,
     SpatialSoftmaxConvNet,
     TaskConditionedVisionFlowPolicy,
@@ -90,9 +89,6 @@ def test_config_validation_and_serialization() -> None:
     with pytest.raises(ValueError, match="real_ratio"):
         AlloyTrainConfig(train_mode="cotrain", real_ratio=1.0)
 
-    with pytest.raises(ValueError, match="divisible"):
-        AlloyTrainConfig(vision_feat_dim=30, num_attn_heads=4)
-
 
 def test_spatial_softmax_and_convnet() -> None:
     """Verify SpatialSoftmax2d coordinate extraction and SpatialSoftmaxConvNet Task FiLM."""
@@ -127,28 +123,30 @@ def test_spatial_softmax_and_convnet() -> None:
     assert not torch.allclose(kp_a, kp_b)
 
 
-def test_multi_camera_attention_side_by_side_slots() -> None:
-    """Verify MultiCameraAttention keeps 3 weighted 32D camera slots side by side (96D)."""
-    attn = MultiCameraAttention(
-        num_cameras=3,
-        vision_feat_dim=32,
-        proprio_emb_dim=64,
-        task_emb_dim=32,
-        num_heads=4,
-    )
-    cam_tokens = torch.randn((4, 3, 32), dtype=torch.float32)
-    z_prop = torch.randn((4, 64), dtype=torch.float32)
-    z_task = torch.randn((4, 32), dtype=torch.float32)
+def test_vision_tokens_and_wrist_cam_drop() -> None:
+    """Verify vision-only token extraction, 3 per-camera aux pos heads, and wrist token drop."""
+    cfg = AlloyTrainConfig(device="cpu", wrist_cam_drop_prob=1.0)
+    policy = TaskConditionedVisionFlowPolicy(cfg)
+    obs = {
+        "proprio": torch.randn((4, 6), dtype=torch.float32),
+        "rgb_third_person_cam": torch.randint(0, 256, (4, 128, 128, 3), dtype=torch.uint8),
+        "rgb_overhead_cam": torch.randint(0, 256, (4, 128, 128, 3), dtype=torch.uint8),
+        "rgb_wrist_cam": torch.randint(0, 256, (4, 128, 128, 3), dtype=torch.uint8),
+    }
+    task_ids = torch.tensor([0, 1, 2, 0], dtype=torch.long)
 
-    attended_slots, weights = attn(cam_tokens, z_prop, z_task, return_weights=True)
-    assert attended_slots.shape == (4, 96)
-    assert weights.shape == (4, 3)
-    assert torch.allclose(weights.sum(dim=-1), torch.ones(4), atol=1e-5)
+    cam_tokens, z_task = policy.encode_vision_tokens(obs, task_ids)
+    assert set(cam_tokens.keys()) == set(CAMERA_NAMES)
+    preds = policy.predict_aux_positions(cam_tokens, z_task)
+    assert set(preds.keys()) == set(CAMERA_NAMES)
+    for cam in CAMERA_NAMES:
+        assert preds[cam].shape == (4, 12)
 
-    # Verify that zeroing out one camera token only changes its corresponding 32D slot
-    # when attention weights are held fixed
-    v = attn.v_proj(cam_tokens)
-    assert v.shape == (4, 3, 32)
+    # In train mode with wrist_cam_drop_prob=1.0, the wrist slice [64:96] of z_fused must be zeroed
+    policy.train()
+    z_fused = policy.extract_obs_features(obs, task_ids, return_aux=False)
+    assert z_fused.shape == (4, 192)
+    assert torch.allclose(z_fused[:, 64:96], torch.zeros((4, 32)))
 
 
 def test_policy_forward_and_norm_buffers() -> None:
@@ -179,10 +177,15 @@ def test_policy_forward_and_norm_buffers() -> None:
     }
     task_ids = torch.tensor([0, 1, 2, 0], dtype=torch.long)
 
+    policy.eval()
     z_fused, aux = policy.extract_obs_features(obs, task_ids, return_aux=True)
     assert z_fused.shape == (4, 192)
-    assert aux["camera_weights"].shape == (4, 3)
     assert set(aux["keypoints"].keys()) == set(CAMERA_NAMES)
+    assert set(aux["cam_tokens"].keys()) == set(CAMERA_NAMES)
+    # Verify exact concatenation order in z_fused: [tok_tp(32), tok_ov(32), tok_wr(32), z_prop(64), z_task(32)]
+    expected_cams = torch.cat([aux["cam_tokens"][c] for c in CAMERA_NAMES], dim=-1)
+    assert torch.allclose(z_fused[:, :96], expected_cams, atol=1e-6)
+    assert torch.allclose(z_fused[:, 160:192], aux["z_task"], atol=1e-6)
 
     # Single-sample velocity prediction (inference shape)
     x_tau_3d = torch.randn((4, 16, 6), dtype=torch.float32)
@@ -219,6 +222,8 @@ def test_flow_matcher_and_temporal_ensembler() -> None:
         },
         "task_id": torch.tensor([0, 1, 2, 1], dtype=torch.long),
         "actions": torch.randn((4, 16, 6), dtype=torch.float32),
+        "obj_xy": torch.randn((4, 12), dtype=torch.float32),
+        "obj_xy_mask": torch.ones((4, 12), dtype=torch.float32),
     }
 
     out = matcher.compute_loss(policy, batch)
@@ -226,9 +231,10 @@ def test_flow_matcher_and_temporal_ensembler() -> None:
     assert torch.isfinite(out["loss"])
     out["loss"].backward()
 
-    # Check gradients flow through task embedding, proprio MLP, camera encoders, and attention
+    # Check gradients flow through task embedding, proprio MLP, camera encoders, and 3 pos heads
     assert policy.task_embedding.weight.grad is not None
-    assert policy.camera_attention.q_proj.weight.grad is not None
+    assert policy.camera_encoders["overhead_cam"].conv4.weight.grad is not None
+    assert policy.aux_cam_pos_heads["overhead_cam"][0].weight.grad is not None
     assert policy.out_head[-1].weight.grad is not None
 
     sampled_actions, aux = matcher.sample_action_chunk(
@@ -239,7 +245,7 @@ def test_flow_matcher_and_temporal_ensembler() -> None:
     high = torch.as_tensor(JOINT_LIMITS_HIGH, dtype=torch.float32)
     assert torch.all(sampled_actions >= low - 1e-5)
     assert torch.all(sampled_actions <= high + 1e-5)
-    assert "camera_weights" in aux
+    assert set(aux["keypoints"].keys()) == set(CAMERA_NAMES)
 
     # Temporal Ensembler test
     ensembler = TemporalEnsembler(chunk_size=4, action_dim=6, decay=0.1)

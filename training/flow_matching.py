@@ -40,7 +40,7 @@ class ConditionalFlowMatcher:
     ) -> dict[str, torch.Tensor]:
         """Compute K-stratified Optimal-Transport Conditional Flow Matching loss.
 
-        Runs the 3-camera CNN + Attention encoder once per minibatch to obtain z_fused (B, 192),
+        Runs the 3-camera CNN encoder once per minibatch to obtain z_fused (B, 192),
         then evaluates the lightweight ResMLP head across K stratified flow timesteps.
         Returns 0-D tensors on the active device to avoid per-batch CPU-GPU sync stalls.
         """
@@ -92,14 +92,13 @@ class ConditionalFlowMatcher:
         weighted_loss = torch.sum(sq_err * dim_w, dim=-1) / torch.sum(dim_w)
         cfm_loss = weighted_loss.mean()
 
-        # 7. Training-only auxiliary 12D tabletop object XY loss (predictions NOT in z_fused)
+        # 7. Training-only auxiliary 12D tabletop object XY loss (3 per-camera heads, w_total = 2.25)
         aux_pos_loss = torch.zeros((), device=device, dtype=torch.float32)
         if use_aux_pos:
             head_weights = {
                 "overhead_cam": 1.0,
                 "third_person_cam": 1.0,
                 "wrist_cam": 0.25,
-                "fused": 1.0,
             }
             w_total = float(sum(head_weights.values()))
             mask = batch["obj_xy_mask"].float()
@@ -108,9 +107,7 @@ class ConditionalFlowMatcher:
             mask_active = (mask_sum > 0.0).float()
 
             y_norm = policy.normalize_obj_xy(batch["obj_xy"].float())
-            pos_preds = policy.predict_aux_positions(
-                aux["cam_tokens"], aux["attended_cams"], aux["z_task"]
-            )
+            pos_preds = policy.predict_aux_positions(aux["cam_tokens"], aux["z_task"])
             demo_pos_loss = torch.zeros((), device=device, dtype=torch.float32)
             for h_name, h_w in head_weights.items():
                 if h_name in pos_preds:
@@ -120,13 +117,11 @@ class ConditionalFlowMatcher:
 
             if "loc_replay" in batch:
                 loc_b = batch["loc_replay"]
-                _, loc_aux = policy.extract_obs_features(
-                    loc_b["obs"], loc_b["task_id"], return_aux=True
+                loc_cam_tokens, loc_z_task = policy.encode_vision_tokens(
+                    loc_b["obs"], loc_b["task_id"]
                 )
                 loc_y_norm = policy.normalize_obj_xy(loc_b["obj_xy"].float())
-                loc_preds = policy.predict_aux_positions(
-                    loc_aux["cam_tokens"], loc_aux["attended_cams"], loc_aux["z_task"]
-                )
+                loc_preds = policy.predict_aux_positions(loc_cam_tokens, loc_z_task)
                 loc_loss = torch.zeros((), device=device, dtype=torch.float32)
                 for h_name, h_w in head_weights.items():
                     if h_name in loc_preds:

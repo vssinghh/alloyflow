@@ -199,7 +199,8 @@ class SimPolicyEvaluator:
                         cam: kp_t[0].detach().cpu().numpy()
                         for cam, kp_t in aux["keypoints"].items()
                     }
-                    cached_weights = aux["camera_weights"][0].detach().cpu().numpy()
+                    if "camera_weights" in aux:
+                        cached_weights = aux["camera_weights"][0].detach().cpu().numpy()
                 else:
                     chunk_t = self.matcher.sample_action_chunk(
                         self.policy,

@@ -321,10 +321,11 @@ class PolicyTrainer:
             final_loc = evaluate_policy_localization(self.policy, val_data, self.device)
             if verbose:
                 ov = final_loc["overhead_cam"]
-                fu = final_loc["fused"]
+                tp = final_loc["third_person_cam"]
+                wr = final_loc["wrist_cam"]
                 print(
                     f"[PostTrainLoc] ov_src={ov['src_err_cm']:.2f}cm (tgt={ov['tgt_err_cm']:.2f}cm, all4={ov['all4_err_cm']:.2f}cm, R2={ov['r2_src_xy'][0]:+.2f},{ov['r2_src_xy'][1]:+.2f}) | "
-                    f"fused_src={fu['src_err_cm']:.2f}cm (all4={fu['all4_err_cm']:.2f}cm)",
+                    f"tp_src={tp['src_err_cm']:.2f}cm | wr_src={wr['src_err_cm']:.2f}cm",
                     flush=True,
                 )
 

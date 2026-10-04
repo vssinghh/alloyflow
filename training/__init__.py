@@ -9,7 +9,6 @@ from training.dataset import (
 )
 from training.flow_matching import ConditionalFlowMatcher, TemporalEnsembler
 from training.model import (
-    MultiCameraAttention,
     ResMLPBlock,
     SinusoidalTimeEmbedding,
     SpatialSoftmax2d,
@@ -28,7 +27,6 @@ __all__ = [
     "AlloyTrainConfig",
     "ConditionalFlowMatcher",
     "HDF5DemoDataset",
-    "MultiCameraAttention",
     "MultiModeBatchLoader",
     "PolicyTrainer",
     "ResMLPBlock",

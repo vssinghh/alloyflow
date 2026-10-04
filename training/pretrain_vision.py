@@ -1,4 +1,4 @@
-"""Stage 1 vision encoder pretraining on rendered multi-camera 4-object layouts."""
+"""Stage 1 vision-only encoder pretraining on rendered multi-camera 4-object layouts."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from torch import nn
 
 from envs.base import CAMERA_NAMES, OBJECT_NAMES, TASK_SPECS, norm_gripper_to_raw
 from envs.sim_env import SimEnv
-from training.config import DEFAULT_TRAIN_CONFIG, AlloyTrainConfig
 from training.model import TaskConditionedVisionFlowPolicy
 
 
@@ -171,27 +170,22 @@ def evaluate_policy_localization(
     val_data: dict[str, torch.Tensor],
     device: torch.device,
 ) -> dict[str, Any]:
-    """Evaluate per-camera and fused localization error (cm) and R^2 on the 300 demo layouts."""
+    """Evaluate per-camera localization error (cm) and R^2 on the 300 demo layouts."""
     policy.eval()
     n = len(val_data["task_id"])
     y_true = val_data["targets_12d"]  # (N, 12)
-    preds_by_head: dict[str, list[torch.Tensor]] = {
-        **{cam: [] for cam in CAMERA_NAMES},
-        "fused": [],
-    }
+    preds_by_head: dict[str, list[torch.Tensor]] = {cam: [] for cam in CAMERA_NAMES}
 
     with torch.no_grad():
         for i in range(0, n, 100):
             tid_b = val_data["task_id"][i : i + 100].to(device)
-            obs_b: dict[str, torch.Tensor] = {
-                "proprio": torch.zeros((len(tid_b), 6), device=device, dtype=torch.float32),
-            }
+            obs_b: dict[str, torch.Tensor] = {}
             for cam in CAMERA_NAMES:
                 obs_b[f"rgb_{cam}"] = (
                     val_data[f"rgb_{cam}"][i : i + 100].to(device).float().div_(255.0)
                 )
-            _, aux = policy.extract_obs_features(obs_b, tid_b, return_aux=True)
-            pos_preds = policy.predict_aux_positions(aux["cam_tokens"], aux["attended_cams"], aux["z_task"])
+            cam_tokens, z_task = policy.encode_vision_tokens(obs_b, tid_b)
+            pos_preds = policy.predict_aux_positions(cam_tokens, z_task)
             for k, v in pos_preds.items():
                 preds_by_head[k].append(policy.unnormalize_obj_xy(v).cpu())
 
@@ -230,7 +224,7 @@ def pretrain_vision_encoders(
     device: torch.device | str = "mps",
     save_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Pretrain camera_encoders, task_embedding, and training-only position heads on 3,000 layouts."""
+    """Pretrain camera_encoders, task_embedding, and per-camera position heads on 3,000 layouts."""
     dev = torch.device(device)
     npz_file = Path(loc_npz_path)
     if not npz_file.exists():
@@ -243,20 +237,17 @@ def pretrain_vision_encoders(
     }
     task_cpu = torch.as_tensor(raw["task_id"], dtype=torch.long)
     targets_cpu = torch.as_tensor(raw["targets_12d"], dtype=torch.float32)
-    proprio_cpu = torch.as_tensor(raw["proprio"], dtype=torch.float32)
 
     obj_mean = targets_cpu.mean(dim=0)
     obj_std = targets_cpu.std(dim=0).clamp(min=1e-2)
     policy.set_obj_xy_stats(obj_mean, obj_std)
     policy.to(dev)
 
-    # Optimize vision encoders, task embedding, multi-camera attention, and training-only position heads
+    # Vision-only Stage 1 optimizer: task_embedding + camera_encoders + aux_cam_pos_heads only
     vis_params = (
         list(policy.task_embedding.parameters())
         + list(policy.camera_encoders.parameters())
-        + list(policy.camera_attention.parameters())
         + list(policy.aux_cam_pos_heads.parameters())
-        + list(policy.aux_fused_pos_head.parameters())
     )
     opt = torch.optim.AdamW(vis_params, lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=5e-5)
@@ -270,20 +261,17 @@ def pretrain_vision_encoders(
         idx = torch.randint(0, n, (batch_size,))
         tid_b = task_cpu[idx].to(dev)
         y_norm = policy.normalize_obj_xy(targets_cpu[idx].to(dev))
-        obs_b: dict[str, torch.Tensor] = {
-            "proprio": proprio_cpu[idx].to(dev),
-        }
+        obs_b: dict[str, torch.Tensor] = {}
         for cam in CAMERA_NAMES:
             obs_b[f"rgb_{cam}"] = imgs_cpu[cam][idx].to(dev).float().div_(255.0)
 
-        _, aux = policy.extract_obs_features(obs_b, tid_b, return_aux=True)
-        preds = policy.predict_aux_positions(aux["cam_tokens"], aux["attended_cams"], aux["z_task"])
+        cam_tokens, z_task = policy.encode_vision_tokens(obs_b, tid_b)
+        preds = policy.predict_aux_positions(cam_tokens, z_task)
 
         loss = (
             F.mse_loss(preds["overhead_cam"], y_norm)
             + F.mse_loss(preds["third_person_cam"], y_norm)
             + 0.5 * F.mse_loss(preds["wrist_cam"], y_norm)
-            + F.mse_loss(preds["fused"], y_norm)
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -295,11 +283,11 @@ def pretrain_vision_encoders(
             val_metrics = evaluate_policy_localization(policy, val_data, dev)
             ov = val_metrics["overhead_cam"]
             tp = val_metrics["third_person_cam"]
-            fu = val_metrics["fused"]
+            wr = val_metrics["wrist_cam"]
             print(
                 f"[PretrainVis {step:04d}/{steps:04d}] loss={loss.item():.4f} | "
                 f"ov_src={ov['src_err_cm']:.2f}cm (tgt={ov['tgt_err_cm']:.2f}cm, all4={ov['all4_err_cm']:.2f}cm, R2={ov['r2_src_xy'][0]:+.2f},{ov['r2_src_xy'][1]:+.2f}) | "
-                f"tp_src={tp['src_err_cm']:.2f}cm | fused_src={fu['src_err_cm']:.2f}cm | {time.perf_counter() - t0:.1f}s",
+                f"tp_src={tp['src_err_cm']:.2f}cm | wr_src={wr['src_err_cm']:.2f}cm | {time.perf_counter() - t0:.1f}s",
                 flush=True,
             )
 

@@ -137,75 +137,6 @@ class SpatialSoftmaxConvNet(nn.Module):
         return self.proj(flat_coords)
 
 
-class MultiCameraAttention(nn.Module):
-    """4-head Query-Key camera attention that keeps weighted camera slots side by side (96D)."""
-
-    def __init__(
-        self,
-        num_cameras: int = len(DEFAULT_TRAIN_CONFIG.camera_names),
-        vision_feat_dim: int = DEFAULT_TRAIN_CONFIG.vision_feat_dim,
-        proprio_emb_dim: int = DEFAULT_TRAIN_CONFIG.proprio_emb_dim,
-        task_emb_dim: int = DEFAULT_TRAIN_CONFIG.task_emb_dim,
-        num_heads: int = DEFAULT_TRAIN_CONFIG.num_attn_heads,
-    ) -> None:
-        super().__init__()
-        self.num_cameras = int(num_cameras)
-        self.vision_feat_dim = int(vision_feat_dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.vision_feat_dim // self.num_heads
-        self.scale = self.head_dim**-0.5
-
-        query_in_dim = proprio_emb_dim + task_emb_dim
-        self.q_proj = nn.Linear(query_in_dim, vision_feat_dim)
-        self.k_proj = nn.Linear(vision_feat_dim, vision_feat_dim)
-        self.v_proj = nn.Sequential(
-            nn.Linear(vision_feat_dim, vision_feat_dim),
-            nn.LayerNorm(vision_feat_dim),
-        )
-        self.slot_norm = nn.LayerNorm(vision_feat_dim)
-
-    def forward(
-        self,
-        cam_tokens: torch.Tensor,
-        z_prop: torch.Tensor,
-        z_task: torch.Tensor,
-        return_weights: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Weight each camera token via Query-Key dot product and keep slots side by side.
-
-        Args:
-            cam_tokens: (B, num_cams, vision_feat_dim) stacked camera embeddings.
-            z_prop: (B, proprio_emb_dim) proprioception embedding.
-            z_task: (B, task_emb_dim) task embedding.
-            return_weights: If True, also return mean (B, num_cams) attention weights.
-
-        Returns:
-            attended_slots: (B, num_cams * vision_feat_dim) side-by-side weighted slots (96D).
-        """
-        b, n_cams, d = cam_tokens.shape
-        q_in = torch.cat([z_prop, z_task], dim=-1)  # (B, 96)
-
-        # Reshape Q to (B, H, 1, D_h) and K, V to (B, H, N_cams, D_h)
-        q = self.q_proj(q_in).reshape(b, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(cam_tokens).reshape(b, n_cams, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(cam_tokens).reshape(b, n_cams, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Attention weights across the 3 cameras per head: (B, H, 1, N_cams)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn_weights = F.softmax(scores, dim=-1)  # sums to 1.0 across the 3 cameras
-
-        # Multiply each camera's Value by (n_cams * attn_weight) with residual + LayerNorm per slot
-        weighted_v = (n_cams * attn_weights.transpose(-2, -1)) * v  # (B, H, N_cams, D_h)
-        weighted_slots = weighted_v.transpose(1, 2).reshape(b, n_cams, d)  # (B, N_cams, D)
-        normed_slots = self.slot_norm(cam_tokens + weighted_slots)
-        attended_slots = normed_slots.reshape(b, n_cams * d)  # (B, 96)
-
-        if return_weights:
-            mean_weights = attn_weights.squeeze(2).mean(dim=1)  # (B, N_cams)
-            return attended_slots, mean_weights
-        return attended_slots
-
-
 class SinusoidalTimeEmbedding(nn.Module):
     """Sinusoidal embedding for continuous flow time tau in [0, 1]."""
 
@@ -257,7 +188,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         # 1. Task Embedding Lookup Table (3 tasks -> 32D)
         self.task_embedding = nn.Embedding(cfg.num_tasks, cfg.task_emb_dim)
 
-        # 2. Causal Proprioception History MLP (18D -> 64D -> 64D)
+        # 2. Causal Proprioception History MLP (6D -> 64D -> 64D)
         self.proprio_mlp = nn.Sequential(
             nn.Linear(cfg.proprio_input_dim, cfg.proprio_emb_dim),
             nn.LayerNorm(cfg.proprio_emb_dim),
@@ -281,16 +212,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             }
         )
 
-        # 4. Multi-Camera Attention keeping 3 weighted camera slots side by side (96D)
-        self.camera_attention = MultiCameraAttention(
-            num_cameras=len(cfg.camera_names),
-            vision_feat_dim=cfg.vision_feat_dim,
-            proprio_emb_dim=cfg.proprio_emb_dim,
-            task_emb_dim=cfg.task_emb_dim,
-            num_heads=cfg.num_attn_heads,
-        )
-
-        # 5. Optimal-Transport Conditional Flow Matching ResMLP Head
+        # 4. Optimal-Transport Conditional Flow Matching ResMLP Head
         chunk_flat_dim = cfg.chunk_size * cfg.action_dim
         self.obs_proj = nn.Sequential(
             nn.Linear(cfg.fused_dim, cfg.hidden_dim),
@@ -315,7 +237,7 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
             nn.Linear(cfg.hidden_dim, chunk_flat_dim),
         )
 
-        # 6. Training-only 12D tabletop object XY heads (NOT concatenated into z_fused)
+        # 5. Training-only per-camera 12D tabletop object XY heads (NOT concatenated into z_fused)
         cam_pos_in_dim = cfg.vision_feat_dim + cfg.task_emb_dim
         self.aux_cam_pos_heads = nn.ModuleDict(
             {
@@ -326,12 +248,6 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
                 )
                 for cam in cfg.camera_names
             }
-        )
-        fused_pos_in_dim = cfg.attended_cam_dim + cfg.task_emb_dim
-        self.aux_fused_pos_head = nn.Sequential(
-            nn.Linear(fused_pos_in_dim, 128),
-            nn.SiLU(),
-            nn.Linear(128, 12),
         )
 
         # Persistent z-score normalization buffers saved inside model checkpoints
@@ -404,14 +320,13 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
     def predict_aux_positions(
         self,
         cam_tokens: dict[str, torch.Tensor],
-        attended_cams: torch.Tensor,
         z_task: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Predict normalized 12D tabletop XY targets from each camera token and attended slots."""
+        """Predict normalized 12D tabletop XY targets from each camera token."""
         preds: dict[str, torch.Tensor] = {}
-        for cam, tok in cam_tokens.items():
+        for cam in self.config.camera_names:
+            tok = cam_tokens[cam]
             preds[cam] = self.aux_cam_pos_heads[cam](torch.cat([tok, z_task], dim=-1))
-        preds["fused"] = self.aux_fused_pos_head(torch.cat([attended_cams, z_task], dim=-1))
         return preds
 
     def _augment_shift(self, img: torch.Tensor) -> torch.Tensor:
@@ -433,13 +348,36 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
         )
         return F.grid_sample(img, grid, mode="bilinear", padding_mode="border", align_corners=False)
 
+    def encode_vision_tokens(
+        self,
+        obs: dict[str, torch.Tensor],
+        task_ids: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Encode 3 camera views and task ID into per-camera 32D tokens without proprioception."""
+        cfg = self.config
+        z_task = self.task_embedding(task_ids.long())  # (B, 32)
+        cam_tokens_dict: dict[str, torch.Tensor] = {}
+        for cam in cfg.camera_names:
+            key = f"rgb_{cam}" if f"rgb_{cam}" in obs else cam
+            img = obs[key]
+            if img.dtype == torch.uint8:
+                if img.ndim == 4 and img.shape[-1] == 3:
+                    img = img.permute(0, 3, 1, 2).contiguous()
+                img = img.float().div_(255.0)
+            elif img.ndim == 4 and img.shape[-1] == 3:
+                img = img.permute(0, 3, 1, 2).contiguous()
+
+            img = self._augment_shift(img)
+            cam_tokens_dict[cam] = self.camera_encoders[cam](img, z_task, return_keypoints=False)
+        return cam_tokens_dict, z_task
+
     def extract_obs_features(
         self,
         obs: dict[str, torch.Tensor],
         task_ids: torch.Tensor,
         return_aux: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
-        """Encode 3 camera views, causal proprioception history, and task ID into a (B, 192) vector."""
+        """Encode 3 camera views, proprioception, and task ID into a (B, 192) vector."""
         cfg = self.config
         z_task = self.task_embedding(task_ids.long())  # (B, 32)
         if "proprio_history" in obs:
@@ -505,23 +443,13 @@ class TaskConditionedVisionFlowPolicy(nn.Module):
                 token = token * keep_cam
             cam_tokens_list.append(token)
 
-        cam_tokens = torch.stack(cam_tokens_list, dim=1)  # (B, 3, 32)
-        if return_aux:
-            attended_cams, attn_weights = self.camera_attention(
-                cam_tokens, z_prop, z_task, return_weights=True
-            )
-        else:
-            attended_cams = self.camera_attention(
-                cam_tokens, z_prop, z_task, return_weights=False
-            )
-
-        z_fused = torch.cat([attended_cams, z_prop, z_task], dim=-1)  # (B, 192)
+        # Concatenate 3 camera tokens in fixed CAMERA_NAMES order (3 x 32D = 96D) + z_prop (64D) + z_task (32D) = 192D
+        cam_concat = torch.cat(cam_tokens_list, dim=-1)  # (B, 96)
+        z_fused = torch.cat([cam_concat, z_prop, z_task], dim=-1)  # (B, 192)
         if return_aux:
             return z_fused, {
                 "keypoints": keypoints_dict,
-                "camera_weights": attn_weights,
                 "cam_tokens": cam_tokens_dict,
-                "attended_cams": attended_cams,
                 "z_task": z_task,
             }
         return z_fused
