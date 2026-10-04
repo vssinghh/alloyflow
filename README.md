@@ -39,8 +39,9 @@ uv run python -m collection --domain real --task 0 --episodes 20
 # 2. Train policy (sim_only | real_only | finetune | cotrain)
 uv run python -m training --mode cotrain --real-ratio 0.5
 
-# 3. Evaluate policy (sim | real | both)
-uv run python -m evaluation --checkpoint checkpoints/cotrain/best_policy.pt --domain both
+# 3. Evaluate policy (120-episode benchmark or per-demo diagnostic GIFs)
+uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --benchmark --episodes 20
+uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --demos demo_0000,demo_0101,demo_0200
 
 # 4. Run unit tests
 uv run pytest
