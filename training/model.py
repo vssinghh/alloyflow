@@ -35,15 +35,12 @@ class SpatialSoftmax2d(nn.Module):
         self,
         features: torch.Tensor,
         return_keypoints: bool = False,
-        viz_temperature: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Compute expected (x, y) coordinates in [-1, 1] for each channel.
 
         Args:
             features: (B, C, H, W) activation heatmaps.
             return_keypoints: If True, also return (B, C, 2) keypoint tensor.
-            viz_temperature: Optional sharp temperature for diagnostic visualization
-                to remove post-GroupNorm background dilution without altering flat_coords.
 
         Returns:
             flat_coords: (B, 2 * C) concatenated [x_0, y_0, x_1, y_1, ...] coordinates.
@@ -63,18 +60,12 @@ class SpatialSoftmax2d(nn.Module):
         flat_coords = keypoints.reshape(b, 2 * c)  # (B, 2 * C)
 
         if return_keypoints:
-            if viz_temperature is not None:
-                viz_probs = F.softmax(flat / max(float(viz_temperature), 1e-4), dim=-1)
-                viz_x = torch.sum(viz_probs * self.grid_x, dim=-1)
-                viz_y = torch.sum(viz_probs * self.grid_y, dim=-1)
-                viz_kp = torch.stack([viz_x, viz_y], dim=-1)
-                return flat_coords, viz_kp
             return flat_coords, keypoints
         return flat_coords
 
 
 class SpatialSoftmaxConvNet(nn.Module):
-    """4-layer ConvNet with GroupNorm, Task FiLM modulation, and 8x8 2D Spatial Softmax."""
+    """4-layer ConvNet with GroupNorm, Task FiLM modulation, and 16x16 2D Spatial Softmax."""
 
     def __init__(
         self,
@@ -85,9 +76,9 @@ class SpatialSoftmaxConvNet(nn.Module):
         keypoint_noise: float = DEFAULT_TRAIN_CONFIG.keypoint_noise,
     ) -> None:
         super().__init__()
-        if img_size % 16 != 0:
-            raise ValueError(f"img_size ({img_size}) must be divisible by 16.")
-        feat_h = img_size // 16
+        if img_size % 8 != 0:
+            raise ValueError(f"img_size ({img_size}) must be divisible by 8.")
+        feat_h = img_size // 8
         self.keypoint_noise = float(keypoint_noise)
 
         self.block1 = nn.Sequential(
@@ -105,7 +96,7 @@ class SpatialSoftmaxConvNet(nn.Module):
             nn.GroupNorm(8, 64),
             nn.SiLU(),
         )
-        self.conv4 = nn.Conv2d(64, num_keypoints, kernel_size=3, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(64, num_keypoints, kernel_size=3, stride=1, padding=1)
         self.gn4 = nn.GroupNorm(4, num_keypoints)
 
         # Task-conditioned FiLM modulation: (1 + gamma) * f + beta before Spatial Softmax
@@ -113,8 +104,7 @@ class SpatialSoftmaxConvNet(nn.Module):
         nn.init.normal_(self.task_film.weight, std=0.02)
         nn.init.zeros_(self.task_film.bias)
 
-        self.act4 = nn.SiLU()
-        self.spatial_softmax = SpatialSoftmax2d(height=feat_h, width=feat_h, temperature=1.0)
+        self.spatial_softmax = SpatialSoftmax2d(height=feat_h, width=feat_h, temperature=0.1)
         self.proj = nn.Sequential(
             nn.Linear(2 * num_keypoints, vision_feat_dim),
             nn.LayerNorm(vision_feat_dim),
@@ -135,13 +125,9 @@ class SpatialSoftmaxConvNet(nn.Module):
 
         gamma, beta = self.task_film(z_task).chunk(2, dim=-1)
         x = (1.0 + gamma.unsqueeze(-1).unsqueeze(-1)) * x + beta.unsqueeze(-1).unsqueeze(-1)
-        x = self.act4(x)
 
         if return_keypoints:
-            viz_temp = 0.08 if not self.training else None
-            flat_coords, kp = self.spatial_softmax(
-                x, return_keypoints=True, viz_temperature=viz_temp
-            )
+            flat_coords, kp = self.spatial_softmax(x, return_keypoints=True)
             if self.training and self.keypoint_noise > 0.0:
                 flat_coords = flat_coords + torch.randn_like(flat_coords) * self.keypoint_noise
             return self.proj(flat_coords), kp

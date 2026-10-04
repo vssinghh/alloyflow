@@ -207,13 +207,13 @@ task_id      (0, 1, 2)   ──> Task Lookup Table     (32D) ──────�
 3. **Tri-Camera Spatial Softmax CNN with Task `FiLM` (`3 x SpatialSoftmaxConvNet`)**:
    - Three independent encoders (one each for `third_person_cam`, `overhead_cam`, and `wrist_cam`).
    - During training, applies $\pm 4\text{ px}$ random bilinear shift augmentation (`shift_pad = 4`), keypoint coordinate noise (`keypoint_noise = 0.01`), and stochastic wrist camera token dropout (`wrist_cam_drop_prob`).
-   - **4 Conv Blocks (`GroupNorm + SiLU` down to `8x8` Spatial Grid)**:
+   - **4 Conv Blocks (`GroupNorm + SiLU` down to `16x16` Spatial Grid)**:
       - `Conv1`: `(3 -> 32, k=5, stride=2, pad=2) + GroupNorm(4, 32) + SiLU` $\to$ `(B, 32, 64, 64)`
       - `Conv2`: `(32 -> 64, k=3, stride=2, pad=1) + GroupNorm(8, 64) + SiLU` $\to$ `(B, 64, 32, 32)`
       - `Conv3`: `(64 -> 64, k=3, stride=2, pad=1) + GroupNorm(8, 64) + SiLU` $\to$ `(B, 64, 16, 16)`
-      - `Conv4`: `(64 -> 32, k=3, stride=2, pad=1) + GroupNorm(4, 32)` + **Task `FiLM`** ($\tilde{f}_c = (1 + \gamma_c(\mathbf{z}_{\text{task}})) f_c + \beta_c(\mathbf{z}_{\text{task}})$) + `SiLU` $\to$ `(B, 32, 8, 8)`
-   - **2D Spatial Softmax (`8x8` Grid, `32` Keypoints, Learnable Temperature)**:
-      - Softmaxes each `8x8` (`64`-cell) heatmap with a learnable temperature parameter (`init_temperature = 1.0`) into a 2D probability distribution $P_c(u, v)$ and computes the expected coordinate $(\mu_{c,x}, \mu_{c,y}) \in [-1, +1]^2$ across all `32` channels (`64D` coordinate vector per camera).
+      - `Conv4`: `(64 -> 32, k=3, stride=1, pad=1) + GroupNorm(4, 32)` + **Task `FiLM`** ($\tilde{f}_c = (1 + \gamma_c(\mathbf{z}_{\text{task}})) f_c + \beta_c(\mathbf{z}_{\text{task}})$) $\to$ `(B, 32, 16, 16)` (no pre-softmax `SiLU` so negative background logits are suppressed cleanly)
+   - **2D Spatial Softmax (`16x16` Grid, `32` Keypoints, Learnable Temperature)**:
+      - Softmaxes each `16x16` (`256`-cell) heatmap with a sharp learnable temperature parameter (`init_temperature = 0.1`) into a 2D probability distribution $P_c(u, v)$ and computes the expected coordinate $(\mu_{c,x}, \mu_{c,y}) \in [-1, +1]^2$ across all `32` channels (`64D` coordinate vector per camera).
    - **Camera Token Projection**:
       - `Linear(64 -> 32) + LayerNorm(32) + SiLU` outputs $\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}} \in \mathbb{R}^{32}$.
 
@@ -248,8 +248,8 @@ task_id      (0, 1, 2)   ──> Task Lookup Table     (32D) ──────�
 | Hyperparameter | Default Value | Purpose |
 | :--- | :---: | :--- |
 | `chunk_size` (`H`) | `16` | `0.8 s` future action horizon at `20 Hz`. |
-| `proprio_history_lags` | `(0, 4, 8, 16, 32)` | Causal proprioception history steps (`(0,)` for single-frame `6D`). |
-| `num_keypoints` / `vision_feat_dim` | `32` / `32` | `32` `(x, y)` keypoints (`64D` from `8x8` grid) projected to `32D` per camera. |
+| `proprio_history_lags` | `(0,)` | Single-frame `6D` proprioception (`(0, 4, 8, ...)` optional for multi-step history). |
+| `num_keypoints` / `vision_feat_dim` | `32` / `32` | `32` `(x, y)` keypoints (`64D` from `16x16` grid, `temp=0.1`) projected to `32D` per camera. |
 | `task_emb_dim` / `proprio_emb_dim` | `32` / `64` | Task lookup embedding and 2-layer proprioception MLP dimensions. |
 | `fused_dim` | `192` | `96D (3 attended cameras) + 64D (proprio) + 32D (task)`. |
 | `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`~1.03M` total policy parameters). |

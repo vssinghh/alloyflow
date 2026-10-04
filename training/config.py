@@ -34,7 +34,7 @@ class AlloyTrainConfig:
     camera_names: tuple[str, ...] = CAMERA_NAMES
     img_size: int = 128
     proprio_dim: int = 6
-    proprio_history_lags: tuple[int, ...] = (0, 4, 8, 16, 32)
+    proprio_history_lags: tuple[int, ...] = (0,)
     action_dim: int = 6
     chunk_size: int = 16
     num_tasks: int = NUM_TASKS
