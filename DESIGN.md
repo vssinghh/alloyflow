@@ -52,9 +52,9 @@ Using the exact same model architecture and test episodes, compare how the robot
 ```text
 alloyflow/                        # Repository Root
 ├── assets/
-│   ├── stage1_pretrain.png       # Phase 1 of 3: Stage 1 Vision Pretraining diagram
-│   ├── stage2_training.png       # Phase 2 of 3: Stage 2 Flow Matching Training diagram
-│   ├── stage3_inference.png      # Phase 3 of 3: Closed-Loop 20 Hz Inference diagram
+│   ├── stage1_pretrain.png       # Stage 1: Vision Pretraining diagram
+│   ├── stage2_training.png       # Stage 2: Flow Matching Training diagram
+│   ├── stage3_inference.png      # Stage 3: Closed-Loop 20 Hz Inference diagram
 │   └── so101/                    # SO-ARM101 MuJoCo XML + 4 tabletop objects
 │
 ├── envs/                         # Sim and Real environments (shared reset/step API)
@@ -75,9 +75,9 @@ alloyflow/                        # Repository Root
 ├── training/                     # Step 2: Model, Stage 1 pretraining & 4-mode training loop
 │   ├── __init__.py
 │   ├── config.py                 # Training hyperparameters
-│   ├── model.py                  # Vision Flow Matching policy + 3 parallel side-branch pos heads
+│   ├── model.py                  # Vision Flow Matching policy + training-only position heads
 │   ├── pretrain_vision.py        # Stage 1 3,000-scene layout generator & vision pretrainer
-│   ├── flow_matching.py          # Flow matching loss, co-supervised pos loss & ODE sampler
+│   ├── flow_matching.py          # Flow matching loss, auxiliary position loss & ODE sampler
 │   ├── dataset.py                # HDF5 loader, 12D object XY labels & Sim+Real batch mixer
 │   ├── trainer.py                # Modes: sim_only, real_only, finetune, cotrain
 │   ├── __main__.py               # CLI: python -m training
@@ -107,17 +107,17 @@ alloyflow/                        # Repository Root
    ```
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
-   # Train on remote Colab GPU (default) and pull checkpoints to checkpoints/<run_name>/
-   ./scripts/train.sh exp04_long_train_60ep --colab --mode sim_only --sim-data data/sim_demos_v2.h5 --pretrained-checkpoint checkpoints/exp02c_no_attn/pretrained_vision.pt
+   # Train on remote Colab GPU (--colab) or local Mac GPU (--local)
+   ./scripts/train.sh sim_only --colab --mode sim_only
+   ./scripts/train.sh sim_only --local --mode sim_only
 
-   # Or train locally on Mac GPU (MPS)
-   ./scripts/train.sh exp04_long_train_60ep --local --mode sim_only --sim-data data/sim_demos_v2.h5
+   # Co-train on 50% Sim + 50% Real
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
    ```bash
-   uv run python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --benchmark --episodes 20
-   uv run python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --benchmark --episodes 20
+   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --demos demo_0000,demo_0101,demo_0200
    ```
 4. **Run Tests**:
    ```bash
@@ -134,51 +134,44 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 - **Camera Images**: Three `128x128` RGB images (`uint8`) per step.
 
 ### 4.1 Simulation Data Collection (`--domain sim`)
-`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) at 5 key poses (`Hover`, `Descend`, `Grasp & Lift`, `Move to Goal`, `Place & Release`) and interpolates smoothly in `6D` joint space so the arm follows a clean upward arc over tabletop clutter. It supports two trajectory profiles via `trajectory_version`:
-- **`trajectory_version = "v2"` (`data/sim_demos_v2.h5`, current default training dataset)**: Uses flat-bottom grasping (`2 to 5` step open dwell at `grasp_z`, `close_in_place` at `grasp_z`, and `2 to 3` step closed hold before lifting), open-in-place target release at `place_z` (`2 to 4` step closed dwell, `open_in_place`, `2` step open hold, and open upward retreat with zero clamped-while-rising steps), and per-episode $\mathcal{U}(0.8, 1.2)$ segment timing jitter (`128 to 165` steps per episode). When loading `"v2"` HDF5 files, `RollingWindowDataset` automatically preserves intentional dwell frames (`trim_stationary = False`) and reads each episode's exact `lift_start_step`.
-- **`trajectory_version = "v1"` (`data/sim_demos.h5`, legacy)**: Continuous 8-segment trajectory (`144` steps per episode) with `trim_stationary = True` during dataset loading.
+`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) across 5 stages (`trajectory_version = "v2"` in `data/sim_demos_v2.h5`):
+1. **Hover & Descend**: Move above the source object and lower the open gripper (`0.75`) down to grasp height.
+2. **Close in Place**: Pause at the bottom for `2 to 5` steps, close the gripper (`0.75 -> 0.08`) while stationary, and hold for `2 to 3` steps before lifting.
+3. **Lift & Carry**: Lift the object in a clean upward arc over tabletop clutter to the target bowl or cube.
+4. **Open in Place & Retract**: Pause at the target for `2 to 4` steps, open the gripper (`0.08 -> 0.75`) while stationary, and retract upward with open jaws.
+5. **Speed Variation ($\pm 20\%$)**: Scale segment speeds by $\mathcal{U}(0.8, 1.2)$ on each episode (`128 to 165` total steps) so the policy learns to trigger actions from visual cues rather than memorizing a fixed step timer.
 
-* **Dataset Scale & Two-Step Randomization Plan (`100` demos per task, `300` total)**:
-  1. **Object `(X, Y)` Positions**: Always randomized across the full reachable tabletop workspace on every episode.
-  2. **Visual & Physical Domain Randomization (`--dr`)**:
-     - First, we verify the planner and policy on **Clean Simulation** (`50` demos per task with fixed studio lighting and camera mounts) to confirm `90%+` task success.
-     - Next, we collect **`50` Domain-Randomized (`DR`) demos per task** (varying lighting direction, object/tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass `0.7x to 1.5x`), giving **`100` Sim demos per task (`300` total)** in `data/sim_demos_v2.h5` (and `data/sim_demos.h5` on the exact same `300` scene seeds).
+* **Dataset Scale & Domain Randomization (`100` demos per task, `300` total)**:
+  - **Clean Simulation (`50` demos per task, `150` total)**: Randomized object `(X, Y)` positions across the table with fixed studio lighting and camera mounts.
+  - **Domain-Randomized Simulation (`50` demos per task, `150` total)**: Varies lighting direction, object and tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass (`0.7x to 1.5x`).
 
-* **Mandatory Quality & Constraint Checks (Verified Before Saving Any Demo)**:
-  Every simulated episode must pass 4 automated checks before it is written to `.h5` (failed seeds are skipped automatically):
-  1. **Spawn Clearance Check (Before Step 0)**: All 4 objects (`pen_holder`, `cup`, `bowl`, `rubiks_cube`) must spawn inside the reachable workspace with at least **`8 cm` center-to-center distance** between every pair of objects and zero initial collisions.
-  2. **Motion & Grasp Integrity Check**: In `v1`, any step where both the arm and gripper barely move ($\|\Delta q_t\| < 10^{-3}$) is trimmed. In `v2`, explicit short dwell segments at `grasp_z` and `place_z` are preserved so the gripper closes and opens while the arm is stationary.
-  3. **Bystander Object Check (Zero Unwanted Collisions)**: Non-target objects on the table must not be tipped over or pushed more than **`1.5 cm`** from their starting positions during the run.
-  4. **Task Completion & Settling Check (End of Episode)**: After releasing the object and retracting the gripper upward, the simulation steps forward `10` extra settling frames and verifies:
-     - **Task 0 (`pick_pen_holder_to_bowl`)**: `pen_holder` is upright inside the `bowl` radius.
-     - **Task 1 (`pick_cup_to_bowl`)**: `cup` is upright inside the `bowl` radius.
-     - **Task 2 (`stack_cup_on_cube`)**: `cup` is upright, centered within `2.0 cm` of the `rubiks_cube`, and resting stably on its top face with the gripper clear.
+* **4 Automated Quality Checks (Verified Before Saving Any Demo)**:
+  Every simulated episode must pass 4 checks before it is written to `.h5` (failed seeds are skipped automatically):
+  1. **Spawn Clearance Check**: All 4 objects spawn inside the reachable workspace with at least `8 cm` center-to-center distance and zero initial collisions.
+  2. **Grasp & Release Dwell Check**: Preserves explicit short pauses during grasp closure and target release while trimming unintended dead frames.
+  3. **Bystander Object Check**: Non-target objects on the table must not be tipped over or pushed more than `1.5 cm` from their starting positions.
+  4. **Task Completion & Settling Check**: After releasing the object and retracting the gripper, the simulation steps forward `10` extra settling frames and verifies that the target object rests upright inside the bowl (`Task 0`, `Task 1`) or centered within `2.0 cm` on top of the Rubik's cube (`Task 2`) with the gripper clear.
 
 ### 4.2 Real Robot Data Collection (`--domain real`)
 `collection/real_teleop.py` records demonstrations on the physical SO-ARM101 using **leader-follower teleoperation** at `20 Hz`:
 1. **Leader Arm (Motor Torque Off)**: You move the leader arm by hand. Every `50 ms`, the script reads its `6` servo positions over USB.
 2. **Follower Arm (Motor Torque On)**: The follower arm copies the leader arm's `6` joint positions in real time while the script records the follower's actual joint positions, the commanded joint targets, and the 3 USB camera frames.
-3. **Keyboard Controls**:
-   - Press `SPACE` to start recording an episode, and `SPACE` again when finished to save it.
-   - Press `r` (or `BACKSPACE`) if you make a mistake to throw away the current attempt and try again.
+3. **Keyboard Controls**: Press `SPACE` to start and stop recording an episode, or `r` (`BACKSPACE`) to discard a failed attempt. We collect **`20` demos per task (`60` total)** into `data/real_demos.h5`.
 
-We collect **`20` clean demos per task (`60` total)** into `data/real_demos.h5`.
-
-### 4.3 HDF5 File Format (`data/sim_demos.h5`, `data/sim_demos_v2.h5` & `data/real_demos.h5`)
+### 4.3 HDF5 File Format (`data/sim_demos_v2.h5` & `data/real_demos.h5`)
 ```text
 <domain>_demos.h5
 ├── attrs:
 │   ├── num_episodes: N
 │   ├── num_cameras: 3
 │   ├── control_hz: 20
-│   ├── trajectory_version: "v1" | "v2"
+│   ├── trajectory_version: "v2"
 │   └── camera_names: ["third_person_cam", "overhead_cam", "wrist_cam"]
 └── demo_0000/
     ├── attrs:
     │   ├── task_id: 0 | 1 | 2
     │   ├── task_name: str
     │   ├── domain: "sim_clean" | "sim_dr" | "real"
-    │   ├── trajectory_version: "v1" | "v2"
     │   ├── seed: int
     │   ├── num_steps: T
     │   └── lift_start_step: int
@@ -192,105 +185,55 @@ We collect **`20` clean demos per task (`60` total)** into `data/real_demos.h5`.
 
 ***
 
-## 5. Policy Architecture & 3-Phase Training/Inference Pipeline (`training/`)
+## 5. Policy Architecture & 3-Stage Pipeline (`training/`)
 
-All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the same **`TaskConditionedVisionFlowPolicy`** (`AlloyFlowPolicy`) network. To prevent the vision encoders from underfitting on `300` demonstrations, the pipeline operates across **three distinct phases**:
-1. **Phase 1 (`Stage 1: Vision Pretraining`)**: Strictly vision-only (`encode_vision_tokens`). Pretrains the 3 camera CNNs, task embedding, and 3 parallel per-camera `12D` object position heads (`aux_cam_pos_heads`) on `3,000` labeled tabletop scenes (`data/loc_layouts_3000.npz`).
-2. **Phase 2 (`Stage 2: Flow Matching Training + Co-Supervised Aux Position Loss`)**: Trains the full policy end-to-end on trajectory demonstrations while keeping the 3 parallel per-camera position heads active as training-only side branches (`L_total = L_CFM + 0.5 * L_pos`). The three `32D` camera tokens (`[tok_third_person, tok_overhead, tok_wrist] = 96D`) are concatenated directly with `z_prop (64D)` and `z_task (32D)` into `z_fused (192D)` with zero attention bottleneck.
-3. **Phase 3 (`Stage 3: Closed-Loop 20 Hz Inference`)**: Ignores all 3 position heads (`1,026,435` active parameters), computes the `192D` observation vector `z_fused` once per control step, and integrates the `4-Block Flow ResMLP` over Euler ODE steps.
+All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the same **`TaskConditionedVisionFlowPolicy`** network (`1.06M` trainable parameters; `1.03M` active at inference).
 
-### 5.1 Three-Phase Pipeline Diagrams
+### 5.1 The 3-Stage Pipeline
 
-#### Phase 1 of 3: Stage 1 Vision Pretraining (`3,000` Steps on `data/loc_layouts_3000.npz`)
+#### Stage 1: Vision Pretraining (`3,000` Labeled Tabletop Scenes)
+![Stage 1: Vision Pretraining](assets/stage1_pretrain.png)
+* **Why**: `300` demonstrations are too few distinct tabletop layouts for action loss alone to teach the CNNs accurate 2D object coordinates.
+* **How (`training/pretrain_vision.py`)**: Renders `3,000` static 3-camera scenes (`data/loc_layouts_3000.npz`, `50%` clean + `50%` domain-randomized) and trains the 3 camera CNNs, Task Embedding, and 3 per-camera `12D` object-position heads (`aux_cam_pos_heads`) for `3,000` steps to predict the `(X, Y)` tabletop coordinates of `[source, target, pen_holder, cup, bowl, rubiks_cube]`.
 
-![Phase 1 of 3: Stage 1 Vision Pretraining](assets/stage1_pretrain.png)
+#### Stage 2: Flow Matching Training + Co-Supervised Position Loss (`60` Epochs)
+![Stage 2: Flow Matching Training](assets/stage2_training.png)
+* **How (`training/trainer.py`, `training/flow_matching.py`)**: Starts from the Stage 1 vision weights and trains the full policy for `60` epochs (`batch_size = 128`, cosine learning rate `5e-4 -> 2.5e-5`).
+* **Training-Only Position Side Branch**: The 3 per-camera position heads remain active during Stage 2 as parallel side branches ($\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + 0.5 \cdot \mathcal{L}_{\text{pos}}$, mixing demo frames and replayed Stage 1 layouts) so the CNNs keep sub-centimeter object localization while the Flow ResMLP learns control. Their `12D` coordinate outputs never enter the policy trunk.
+* **Best Checkpoint Selection**: At the end of each epoch, evaluates 10-step ODE action-chunk error (`val_ode_mse`) on `512` validation samples in `eval()` mode and saves the lowest-error weights to `best_policy.pt`.
 
-* **Dataset (`data/loc_layouts_3000.npz`)**: `3,000` static 3-camera tabletop scenes (`50%` clean + `50%` domain-randomized, `50%` at home pose + `50%` at random demo arm postures) labeled with `12D` tabletop `(X, Y)` coordinates:
-  $$\mathbf{y}_{\text{pos}} = [x_{\text{src}}, y_{\text{src}}, \, x_{\text{tgt}}, y_{\text{tgt}}, \, x_{\text{pen}}, y_{\text{pen}}, \, x_{\text{cup}}, y_{\text{cup}}, \, x_{\text{bowl}}, y_{\text{bowl}}, \, x_{\text{cube}}, y_{\text{cube}}] \in \mathbb{R}^{12}$$
-* **Strictly Vision-Only (`encode_vision_tokens`)**:
-  - **`[TRAINED]`**: `3x SpatialSoftmaxCNN`, `Task Embedding (3 -> 32D)`, and the **3 parallel per-camera `12D` position heads** (`aux_cam_pos_heads`: one each for `third_person_cam`, `overhead_cam`, and `wrist_cam`).
-  - **`Unused`**: `ProprioMLP (6D -> 64D)` and the `4-Block Flow ResMLP` are not called or touched in Stage 1.
-* **Stage 1 Loss**:
-  $$\mathcal{L}_{\text{Stage 1}} = 1.0 \cdot \text{MSE}_{\text{overhead}} + 1.0 \cdot \text{MSE}_{\text{third\_person}} + 0.5 \cdot \text{MSE}_{\text{wrist}}$$
+#### Stage 3: Closed-Loop Inference on the Robot (`20 Hz`)
+![Stage 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
+* **Zero Position-Head Overhead**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$), and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
 
-#### Phase 2 of 3: Stage 2 Flow Matching Training + Co-Supervised Aux Position Loss (`60` Epochs)
-
-![Phase 2 of 3: Stage 2 Flow Matching Training](assets/stage2_training.png)
-
-* **All modules `[TRAINED]`**: Starts from the Stage 1 vision weights (or loads an existing `pretrained_vision.pt` via `--pretrained-checkpoint`, such as `checkpoints/exp02c_no_attn/pretrained_vision.pt`) and trains the entire network (`camera_encoders`, `proprio_mlp`, `task_embedding`, `4-Block Flow ResMLP`, and the 3 parallel per-camera position heads) for `60` epochs (`batch_size = 128`, cosine LR schedule from `lr = 5.0e-4` to `eta_min = 2.5e-5` over `60` epochs, `1,056,039` trainable parameters) on Colab GPU (`--colab`) or local Mac MPS (`--local`) via `scripts/train.sh`. Current baseline checkpoint: `checkpoints/exp04_long_train_60ep/best_policy.pt` trained on `data/sim_demos_v2.h5`.
-* **Direct Camera Concatenation & Training-Only Parallel Side Branches (Never in `z_fused`)**:
-  - The 3 per-camera position heads (`aux_cam_pos_heads`) run **in parallel** (none feeds into another) and sit strictly in a training-only side branch (`predict_aux_positions`).
-  - Their `12D` coordinate predictions **never** enter `z_fused`. Instead, the three `32D` camera tokens are concatenated directly in fixed slot order (`CAMERA_NAMES`) with `z_prop` and `z_task` to form `z_fused`:
-    $$\mathbf{z}_{\text{fused}} = [\text{tok}_{\text{third\_person}}(32\text{D}) \,;\, \text{tok}_{\text{overhead}}(32\text{D}) \,;\, \text{tok}_{\text{wrist}}(32\text{D}) \,;\, \mathbf{z}_{\text{prop}}(64\text{D}) \,;\, \mathbf{z}_{\text{task}}(32\text{D})] \in \mathbb{R}^{192}$$
-  - During training (`model.train()`), `wrist_cam_drop_prob = 0.05` zeros out the wrist camera token slice `[64:96]` in `z_fused` on `5%` of samples so the policy never over-relies on a single occluded view.
-* **Stage 2 Total Loss (`compute_loss` in `training/flow_matching.py`)**:
-  $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + 0.5 \cdot \mathcal{L}_{\text{pos}}, \qquad \mathcal{L}_{\text{pos}} = 0.5 \cdot \mathcal{L}_{\text{pos, demo}} + 0.5 \cdot \mathcal{L}_{\text{pos, replay}}$$
-  - $\mathcal{L}_{\text{pos, demo}}$: Computed on the `128` demo frames in the batch (`src_xy` and the picked object's `(X, Y)` coordinates are masked out via `obj_xy_mask` for `raw_idx >= lift_start_step`, defaulting to `45` in `v1`, once the object is lifted off the table).
-  - $\mathcal{L}_{\text{pos, replay}}$: Computed via `encode_vision_tokens` on `32` static layouts replayed from `data/loc_layouts_3000.npz` on every batch so the CNNs never forget wide-workspace localization.
-  - Both parts average the 3 parallel per-camera head MSEs with weights `1.0` (`overhead_cam`), `1.0` (`third_person_cam`), and `0.25` (`wrist_cam`) (`w_total = 2.25`).
-
-#### Phase 3 of 3: Closed-Loop Inference on the Robot (`20 Hz`)
-
-![Phase 3 of 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
-
-* **Zero inference overhead**: During `predict_action_chunk`, all 3 position heads (`29,604` parameters) are completely ignored (`1,026,435` active inference parameters). The policy calls `encode_observations` once per `50 ms` control step (`exec_horizon = 1`) to build $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$, integrates `Flow ResMLP` over `5` Euler ODE steps ($\Delta \tau = 0.2$, `ode_steps = 5`), and blends overlapping `16 x 6` chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$, `temporal_ensemble_decay = 0.05`). As shown in Study 03b (`EXPERIMENT_LOG.md`), `decay = 0.05` provides lookahead over servo tracking lag (whereas larger decay weights `age = 0..2` near the lagging current joint state and induces descent/target stalls) while averaging out `16` independent Gaussian ODE draws $x_0 \sim \mathcal{N}(0, I)$.
-
-#### Component Summary Across All 3 Phases
-
-| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training | Stage 3: `20 Hz` Inference |
+| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training (`60` Ep) | Stage 3: `20 Hz` Inference |
 | :--- | :--- | :--- | :--- |
-| **`3x Spatial Softmax CNN`** | **`[TRAINED]`** from scratch | **`[TRAINED]`** (fine-tuned) | **Used** (frozen weights) |
-| **`Task Embedding (3 -> 32D)`** | **`[TRAINED]`** from scratch | **`[TRAINED]`** (fine-tuned) | **Used** (frozen weights) |
-| **`Proprio MLP (6 -> 64D)`** | **Unused** | **`[TRAINED]`** from scratch | **Used** (frozen weights) |
-| **`3 Per-Camera Pos Heads`** | **`[TRAINED]`** (`w = 1.0, 1.0, 0.5`) | **`[TRAINED]`** (`w = 1.0, 1.0, 0.25`) | **Ignored** (not called) |
-| **`z_fused (192D)`** | Not built (only `3x 32D` `cam_tokens` built) | **Built** (`[tok_tp, tok_ov, tok_wr, z_prop, z_task]`) | **Built once per step** (`192D`) |
-| **`4-Block Flow ResMLP`** | **Unused** | **`[TRAINED]`** from scratch | **Used** (`5` Euler ODE steps at inference) |
+| **`3x Spatial Softmax CNN`** | Trained from scratch | Fine-tuned | Used (`96D` camera tokens) |
+| **`Task Embedding (3 -> 32D)`** | Trained from scratch | Fine-tuned | Used (`32D` task vector) |
+| **`Proprio MLP (6 -> 64D)`** | Unused | Trained from scratch | Used (`64D` joint vector) |
+| **`3 Per-Camera Pos Heads`** | Trained (`12D` XY targets) | Co-supervised (`0.5 * L_pos`) | **Ignored** (zero overhead) |
+| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step) | Used (`5` Euler ODE steps) |
 
-### 5.2 Detailed Layer-by-Layer Specification
+***
+
+### 5.2 Model Building Blocks (`training/model.py`)
 
 1. **Task Embedding (`nn.Embedding(3, 32)`)**:
-   - Maps discrete `task_id in {0, 1, 2}` to a learnable `32D` task vector $\mathbf{z}_{\text{task}} \in \mathbb{R}^{32}$.
-   - Enters **three** places across the architecture: (a) Task `FiLM` inside each of the 3 camera CNNs, (b) the `192D` fused vector $\mathbf{z}_{\text{fused}}$ entering the `ResMLP`, and (c) the input of all 3 parallel per-camera auxiliary position heads during training.
-
-2. **Proprioception & Causal History MLP (`proprio_input_dim -> 64D -> 64D`)**:
-   - Normalizes raw `6D` joint state $\mathbf{q}_t$ (`5` arm joints in radians + `1` gripper in `[0, 1]`) via dataset z-score statistics ($\tilde{\mathbf{q}}_t = (\mathbf{q}_t - \boldsymbol{\mu}_q) / \boldsymbol{\sigma}_q$, stored inside checkpoint buffers).
-   - Configured via `proprio_history_lags` (default single-frame `(0,)` = `6D`, removing multi-step velocity copycat shortcuts).
-   - During Stage 2 training (`model.train()`), applies Gaussian jitter (`proprio_noise_std = 0.02`) to the normalized joint inputs and modality dropout (`proprio_drop_prob = 0.10`) on the resulting `64D` embedding $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$.
-   - Passes the input through two `Linear + LayerNorm(64) + SiLU` layers to produce $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$.
-
-3. **Tri-Camera Spatial Softmax CNN with Task `FiLM` (`3 x SpatialSoftmaxConvNet`)**:
-   - Three independent encoders (one each for `third_person_cam`, `overhead_cam`, and `wrist_cam`).
-   - During training, applies $\pm 4\text{ px}$ random bilinear shift augmentation (`shift_pad = 4`), keypoint coordinate noise (`keypoint_noise = 0.01`), and stochastic wrist camera token dropout (`wrist_cam_drop_prob = 0.05`).
-   - **4 Conv Blocks (`GroupNorm + SiLU` down to `16x16` Spatial Grid)**:
-      - `Conv1`: `(3 -> 32, k=5, stride=2, pad=2) + GroupNorm(4, 32) + SiLU` $\to$ `(B, 32, 64, 64)`
-      - `Conv2`: `(32 -> 64, k=3, stride=2, pad=1) + GroupNorm(8, 64) + SiLU` $\to$ `(B, 64, 32, 32)`
-      - `Conv3`: `(64 -> 64, k=3, stride=2, pad=1) + GroupNorm(8, 64) + SiLU` $\to$ `(B, 64, 16, 16)`
-      - `Conv4`: `(64 -> 32, k=3, stride=1, pad=1) + GroupNorm(4, 32)` + **Task `FiLM`** ($\tilde{f}_c = (1 + \gamma_c(\mathbf{z}_{\text{task}})) f_c + \beta_c(\mathbf{z}_{\text{task}})$) $\to$ `(B, 32, 16, 16)` (no pre-softmax `SiLU` so negative background logits are suppressed cleanly)
-   - **2D Spatial Softmax (`16x16` Grid, `32` Keypoints, Learnable Temperature)**:
-      - Softmaxes each `16x16` (`256`-cell) heatmap with a sharp learnable temperature parameter (`init_temperature = 0.1`) into a 2D probability distribution $P_c(u, v)$ and computes the expected coordinate $(\mu_{c,x}, \mu_{c,y}) \in [-1, +1]^2$ across all `32` channels (`64D` coordinate vector per camera).
-   - **Camera Token Projection**:
-      - `Linear(64 -> 32) + LayerNorm(32) + SiLU` outputs $\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}} \in \mathbb{R}^{32}$.
-
-4. **Direct Multi-Camera Concatenation (`3 x 32D = 96D`) & Fusion (`192D`)**:
-   - Directly concatenates the three camera tokens in fixed slot order (`[0:32]` = `third_person_cam`, `[32:64]` = `overhead_cam`, `[64:96]` = `wrist_cam`) without cross-camera attention mixing:
-     $$\mathbf{z}_{\text{cam}} = [\mathbf{z}_{\text{tp}} (32\text{D}) \,;\, \mathbf{z}_{\text{ov}} (32\text{D}) \,;\, \mathbf{z}_{\text{wr}} (32\text{D})] \in \mathbb{R}^{96}$$
-   - During training (`model.train()`), applies stochastic wrist camera token dropout (`wrist_cam_drop_prob = 0.05`) on slice `[64:96]`.
-   - **Fused Conditioning Vector (`192D`)**:
+   - Maps `task_id in {0, 1, 2}` to a `32D` vector $\mathbf{z}_{\text{task}}$ shared across Task `FiLM` inside each camera CNN, the `192D` fused vector $\mathbf{z}_{\text{fused}}$, and the training-only position heads.
+2. **Proprioception MLP (`6D -> 64D -> 64D`)**:
+   - Z-score normalizes the current `6D` joint positions $\mathbf{q}_t$ (`proprio_history_lags = (0,)`) using dataset statistics stored in the checkpoint, and passes them through two `Linear + LayerNorm(64) + SiLU` layers to output $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$. During training, applies small Gaussian noise (`proprio_noise_std = 0.02`) and `10%` embedding dropout (`proprio_drop_prob = 0.10`).
+3. **Tri-Camera Spatial Softmax CNN (`3 x SpatialSoftmaxConvNet`)**:
+   - One independent CNN per camera (`third_person_cam`, `overhead_cam`, `wrist_cam`), with $\pm 4\text{ px}$ random image shift augmentation during training.
+   - **4 Conv Blocks (`128x128 -> 16x16`)**: `Conv1 (k=5, s=2 -> 64x64)`, `Conv2 (k=3, s=2 -> 32x32)`, `Conv3 (k=3, s=2 -> 16x16)` with `GroupNorm + SiLU`, followed by `Conv4 (k=3, s=1 -> 16x16) + GroupNorm + Task FiLM` (without pre-softmax `SiLU` so negative background logits are suppressed).
+   - **2D Spatial Softmax (`16x16` Grid, `32` Keypoints, Learnable `temp=0.1`)**: Extracts `32` expected `(x, y)` keypoint coordinates (`64D`) per camera and projects them via `Linear(64 -> 32) + LayerNorm(32) + SiLU` into camera tokens $\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}} \in \mathbb{R}^{32}$.
+4. **Direct Multi-Camera Concatenation (`192D` Fused Vector)**:
+   - Concatenates the three `32D` camera tokens directly with $\mathbf{z}_{\text{prop}}$ (`64D`) and $\mathbf{z}_{\text{task}}$ (`32D`) without cross-camera attention mixing (applying `5%` training dropout on $\mathbf{z}_{\text{wr}}$):
      $$\mathbf{z}_{\text{fused}} = [\mathbf{z}_{\text{tp}} (32\text{D}) \,;\, \mathbf{z}_{\text{ov}} (32\text{D}) \,;\, \mathbf{z}_{\text{wr}} (32\text{D}) \,;\, \mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{192}$$
+5. **Conditional Flow Matching Head (`4-Block ResMLP`, `K = 4` Stratified Sampling)**:
+   - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.05`) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
+   - Evaluates `K = 4` stratified flow timesteps per observation during training so the 3 CNNs run only once per batch.
 
-5. **Three Parallel Training-Only Auxiliary Position Heads (`aux_cam_pos_heads`)**:
-   - Three independent MLPs (`Linear(64 -> 128) + SiLU + Linear(128 -> 12)`), one per camera, each taking `[tok_c(32D), z_task(32D)]` and predicting normalized `12D` object `(X, Y)` coordinates (`obj_xy_mean` and `obj_xy_std` stored as model buffers).
-
-6. **Optimal-Transport Conditional Flow Matching Head (`4-Block ResMLP` + `K = 4` Stratified Sampling)**:
-   - **Target Action Chunk ($x_1$)**: Next `16` steps of `6D` joint commands `(16, 6)` (`0.8 s` at `20 Hz`), z-score normalized using `action_mean` and `action_std`. At episode boundaries (`t > T - 16`), steps beyond `T - 1` repeat `actions[T - 1]` so the robot holds its final retracted pose cleanly.
-   - **Nonlinear Observation Conditioning (`obs_proj`)**: Projects $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ through a 2-layer nonlinear MLP (`Linear(192 -> 256) + LayerNorm(256) + SiLU + Linear(256 -> 256) + Dropout`) before summing with `act_proj` and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$).
-   - **Stratified Flow Amortization (`K = 4`)**:
-      - Computes $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ **once** per minibatch through the 3 CNNs and evaluates the lightweight `ResMLP` across `K = 4` stratified flow timesteps $\tau_{i,k} = \frac{k + u_{i,k}}{4}$ for $k \in \{0, 1, 2, 3\}$ and $u_{i,k} \sim \mathcal{U}(0, 1)$.
-   - **Straight-Line Interpolation, Velocity Loss & Validation Selection**:
-      - Samples $x_0 \sim \mathcal{N}(0, I)$, forms $x_\tau = (1 - \tau) x_0 + \tau x_1$, and trains $v_\theta(x_\tau, \tau \mid \mathbf{z}_{\text{fused}})$ to match $u_\tau = x_1 - x_0$ using dimension-weighted MSE with `gripper_weight = 2.5` on joint `5`.
-      - At the end of each epoch, evaluates deterministic 10-step Euler ODE action-chunk MSE (`val_ode_mse`) in `policy.eval()` mode on `val_samples_per_epoch = 512` transitions and saves the lowest-error model to `best_policy.pt`.
-   - **Closed-Loop Inference (`20 Hz`)**:
-      - Re-queries every control step (`exec_horizon = 1`), integrates $v_\theta$ from $\tau = 0 \to 1$ in `5` Euler steps ($\Delta \tau = 0.2$, `ode_steps = 5`), and blends overlapping `16`-step predictions using **Temporal Ensembling** ($w_i = \exp(-0.05 \cdot i)$, `temporal_ensemble_decay = 0.05`, validated in Study 03b to overcome servo tracking lag and suppress ODE draw variance).
+***
 
 ### 5.3 The 4 Training Modes & Default Hyperparameters (`training/config.py`)
 
@@ -298,38 +241,38 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | :--- | :--- | :--- | :---: | :--- |
 | **`sim_only`** | `data/sim_demos_v2.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2.h5` & saved in checkpoint |
 | **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
-| **`finetune`** | Pretrained `exp04_long_train_60ep` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
+| **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
 | **`cotrain`** | `data/sim_demos_v2.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
 
 | Hyperparameter | Default Value | Purpose |
 | :--- | :---: | :--- |
-| `chunk_size` (`H`) | `16` | `0.8 s` future action horizon at `20 Hz`. |
-| `proprio_history_lags` | `(0,)` | Single-frame `6D` proprioception (`(0, 4, 8, ...)` optional for multi-step history). |
-| `num_keypoints` / `vision_feat_dim` | `32` / `32` | `32` `(x, y)` keypoints (`64D` from `16x16` grid, `temp=0.1`) projected to `32D` per camera. |
-| `task_emb_dim` / `proprio_emb_dim` | `32` / `64` | Task lookup embedding and 2-layer proprioception MLP dimensions. |
-| `fused_dim` | `192` | `96D (3 concatenated cameras) + 64D (proprio) + 32D (task)`. |
-| `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`1,056,039` trainable params; `1,026,435` active at inference). |
-| `pretrain_loc_steps` / `loc_data_path` | `3000` / `data/loc_layouts_3000.npz` | Stage 1 vision pretraining steps and rendered `3,000`-scene layout cache. |
-| `aux_pos_loss_weight` | `0.5` | Stage 2 co-supervision weight on $\mathcal{L}_{\text{pos}} = 0.5 \cdot \mathcal{L}_{\text{pos, demo}} + 0.5 \cdot \mathcal{L}_{\text{pos, replay}}$. |
-| `num_flow_samples` (`K`) | `4` | Stratified flow timesteps per CNN forward pass. |
-| `gripper_weight` | `2.5` | Loss weight on gripper dimension `5` (`1.0` on arm dimensions `0..4`). |
-| `shift_pad` / `keypoint_noise` | `4` / `0.01` | Random $\pm 4\text{ px}$ image shift and `0.01` training keypoint jitter. |
-| `proprio_noise_std` / `proprio_drop_prob` | `0.02` / `0.10` | Training Gaussian jitter on normalized $\tilde{\mathbf{q}}$ and `z_prop` dropout probability. |
-| `wrist_cam_drop_prob` / `dropout` | `0.05` / `0.05` | Wrist camera token dropout and `ResMLP` activation dropout. |
-| `batch_size` / `epochs` | `128` / `60` | `240` effective flow passes per sample (`60 * K`), AdamW (`wd = 1e-4`), cosine LR (`5e-4 -> 2.5e-5`). |
-| `val_samples_per_epoch` | `512` | Validation samples used to compute 10-step eval-mode `val_ode_mse` for `best_policy.pt`. |
-| `ode_steps` / `exec_horizon` / `temporal_ensemble_decay` | `5` / `1` / `0.05` | Closed-loop inference Euler ODE steps (`10` for `val_ode_mse`), single-step re-query, and $w_i = \exp(-0.05 \cdot i)$ blending (Study 03b). |
+| `chunk_size` (`H`) / `proprio_history_lags` | `16` / `(0,)` | `0.8 s` future action horizon (`16 x 6`) and single-frame `6D` joint input. |
+| `num_keypoints` / `vision_feat_dim` | `32` / `32` | `32` `(x, y)` keypoints (`16x16` grid, `temp=0.1`) projected to `32D` per camera. |
+| `task_emb_dim` / `proprio_emb_dim` / `fused_dim` | `32` / `64` / `192` | `96D (3 cameras) + 64D (proprio) + 32D (task) = 192D`. |
+| `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`1.06M` trainable params; `1.03M` active at inference). |
+| `pretrain_loc_steps` / `aux_pos_loss_weight` | `3000` / `0.5` | Stage 1 vision pretraining steps (`data/loc_layouts_3000.npz`) and Stage 2 position loss weight. |
+| `num_flow_samples` (`K`) / `gripper_weight` | `4` / `2.5` | Stratified flow samples per CNN pass and loss weight on gripper joint `5`. |
+| `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.05` | Image shift augmentation (`px`), training keypoint noise, and `ResMLP` dropout. |
+| `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.02` / `0.10` / `0.05` | Training-only sensor noise and modality dropout probabilities. |
+| `batch_size` / `epochs` / `val_samples_per_epoch` | `128` / `60` / `512` | `240` flow passes per sample (`60 * K`), AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check. |
+| `ode_steps` / `exec_horizon` / `temporal_ensemble_decay` | `5` / `1` / `0.05` | Closed-loop inference Euler steps, single-step re-query, and $w_i = \exp(-0.05 \cdot i)$ blending. |
 
 ***
 
 ## 6. Closed-Loop Evaluation & Visual Diagnostics (`evaluation/`)
 
-`evaluation/evaluator.py` (`SimPolicyEvaluator`) and `evaluation/visualizer.py` (`RolloutVisualizer`) execute closed-loop physics rollouts in `SimEnv` at `20 Hz` (`max_steps = 280`, `14.0 s` horizon, `ode_steps = 5`, `exec_horizon = 1`, `temporal_ensemble_decay = 0.05`) and record first-pass task and constraint completion (`all_constraints_passed`).
+`evaluation/evaluator.py` (`SimPolicyEvaluator`) and `evaluation/visualizer.py` (`RolloutVisualizer`) run closed-loop rollouts in `SimEnv` at `20 Hz` (`max_steps = 280`, `14.0 s` horizon) and check whether all task and safety constraints pass (`all_constraints_passed`).
 
-### 6.1 Train vs. Held-Out Test Split Protocol (`--benchmark`)
-Running `python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --benchmark --episodes 20` evaluates **`120` closed-loop episodes total**:
-1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds stored in `data/sim_demos_v2.h5` (`seeds 1000..1549` for Task 0, `2000..2549` for Task 1, `3000..3549` for Task 2) to measure in-distribution closed-loop execution accuracy.
-2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019` for Task 0, `10000..10019` for Task 1, `11000..11019` for Task 2) where all 4 objects spawn at novel tabletop positions never seen during training.
+### 6.1 Benchmark Split (`120` Episodes Total)
+Running `python -m evaluation --checkpoint <path> --benchmark --episodes 20` evaluates **`120` episodes**:
+1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds from `data/sim_demos_v2.h5` (`seeds 1000..1549`, `2000..2549`, `3000..3549`) to test in-distribution accuracy.
+2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019`, `10000..10019`, `11000..11019`) with novel object placements.
 
-### 6.2 Automated Failure-Stage Diagnosis & Multi-Camera HUD GIFs
-Every episode returns an `EpisodeEvalResult` tracking closest pinch-to-source XY distance (`min_pinch_src_xy_cm`), horizontal offset and vertical height at initial gripper close (`grasp_close_xy_cm`, `grasp_close_dz_cm`, `grasp_close_step`), maximum object lift (`max_src_lift_cm`), final object-to-target XY distance (`final_src_tgt_xy_cm`), bystander/target disturbance checks, and an automated failure classification (`PASS`, `Missed source reach`, `Closed off-center`, `Failed grasp/lift`, `Missed target`, or `Bystander/Target disturbed`). When `--demos` or `--save-gif` is enabled, `RolloutVisualizer` saves both an animated multi-camera `.gif` and a 6-keyframe `.png` strip overlaying projected `[SRC]` and `[TGT]` markers, the predicted 16-step trajectory ribbon, and live joint telemetry.
+### 6.2 Core Funnel Metrics & Diagnostic GIFs
+Every benchmark run reports 4 stage-by-stage metrics across all `120` episodes:
+1. **Reached Object (`< 2.0 cm`)**: Minimum horizontal distance between the gripper pinch point and the source object.
+2. **Centered Grasp (`< 1.5 cm` at close)**: Horizontal offset when the gripper first starts closing (`action[5] < 0.48`).
+3. **Lifted Object (`> 2.0 cm`)**: Whether the source object is lifted at least `2.0 cm` above the table.
+4. **Task Success (`Strict Pass`)**: Object placed upright inside the goal receptacle with the gripper open and retracted clear, and zero bystander or target collisions.
+
+When `--demos` or `--save-gif` is passed, `RolloutVisualizer` saves a multi-camera `.gif` and a 6-keyframe `.png` strip showing projected `[SRC]` and `[TGT]` markers, the predicted 16-step trajectory ribbon, and live joint telemetry.
