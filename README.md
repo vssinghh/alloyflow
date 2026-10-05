@@ -36,7 +36,9 @@ uv sync
 uv run python -m collection --domain sim --task all --episodes 100
 uv run python -m collection --domain real --task 0 --episodes 20
 
-# 2. Train policy (sim_only | real_only | finetune | cotrain)
+# 2. Train policy (Colab GPU or local Mac MPS; modes: sim_only | real_only | finetune | cotrain)
+./scripts/train.sh exp03_v2_try1 --colab --mode sim_only
+./scripts/train.sh exp03_v2_try1 --local --mode sim_only
 uv run python -m training --mode cotrain --real-ratio 0.5
 
 # 3. Evaluate policy (120-episode benchmark or per-demo diagnostic GIFs)

@@ -90,6 +90,9 @@ alloyflow/                        # Repository Root
 │   ├── __main__.py               # CLI: python -m evaluation
 │   └── tests/
 │
+├── scripts/
+│   └── train.sh                  # Unified training launcher (--colab GPU or --local Mac MPS)
+│
 ├── DESIGN.md
 ├── EXPERIMENT_LOG.md
 ├── README.md
@@ -104,6 +107,11 @@ alloyflow/                        # Repository Root
    ```
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
+   # Train on remote Colab GPU (default) and pull checkpoints to checkpoints/<run_name>/
+   ./scripts/train.sh exp03_v2_try1 --colab --mode sim_only --sim-data data/sim_demos_v2.h5 --pretrained-checkpoint checkpoints/exp02c_no_attn/pretrained_vision.pt
+
+   # Or train locally on Mac GPU (MPS)
+   ./scripts/train.sh exp03_v2_try1 --local --mode sim_only --sim-data data/sim_demos_v2.h5
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
