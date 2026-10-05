@@ -280,3 +280,54 @@ In `Exp 02c`, `78 / 93` failures occurred after reaching within `2.0 cm` of the 
 
 ### 4. What to Try Next
 1. Address the two remaining bottlenecks exposed by `Exp 03` on [`data/sim_demos_v2.h5`](./data/sim_demos_v2.h5): (a) horizontal `(X, Y)` centering before closing in `2a` / `2b`, and (b) preventing early/tilted release over the target rim in `4b_rim_bounce_tipped_src` (`14` episodes) and stationary dwell stalls in `3b` (`11` episodes).
+
+***
+
+## Diagnostic & Inference Study 03b: Bottleneck #1 Root-Cause & `temporal_ensemble_decay` Sweep (`2026-10-05`)
+
+### 1. Goal & New Evaluator Telemetry (`evaluation/evaluator.py`)
+* **Focus**: Bottleneck #1 (`Closing the Fingers Before the Hand Finishes Centering`), which accounts for `39` Stage-2 failures (`23` in `2a_premature_high_close` + `16` in `2b_caged_grasp_then_slip`) and `15` Stage-3 mid-air drops (`3a_mid_air_slip_transit`).
+* **Evaluator Additions** ([`evaluation/evaluator.py`](./evaluation/evaluator.py)):
+  - Added `grasp_close_step`, `grasp_close_xy_cm`, and `grasp_close_dz_cm` to `EpisodeEvalResult` (recorded at the first step where `action_6d[5] < 0.48`).
+  - Added `centered_grasp_close_count`, `centered_grasp_close_rate` (`grasp_close_xy_cm < 1.5 cm`), `mean_grasp_close_xy_cm`, and `mean_grasp_close_dz_cm` to benchmark reports.
+
+### 2. Root-Cause Findings on Bottleneck #1
+1. **Baseline `centered_grasp_close_rate` (`grasp_close_xy_cm < 1.5 cm`)**:
+   - **`Exp 02c` (`v1` demos)**: `60 / 120 (50.0%)` (`28/60` Train, `32/60` Test; `mean_close_xy = 1.98 cm`, `mean_close_dz = +1.84 cm`).
+   - **`Exp 03` (`v2` demos)**: `55 / 120 (45.8%)` (`27/60` Train, `28/60` Test; `mean_close_xy = 2.54 cm`, `mean_close_dz = +1.61 cm`).
+2. **Physical Mechanism (`Open Finger Hits Rim at dz = +4.5 cm, Step ~35`)**:
+   - The cup and pen holder have a top rim radius of `~2.3 cm`, while each wide-open gripper finger (`gq = 0.64`) sits `~2.5 cm` out from `pinch_site`.
+   - In `2a` and `2b`, as the open hand descends through `dz = +4.5 cm` (`step ~35`), it is already `2.7 to 2.8 cm` off-center horizontally (`~2.2 cm` lateral error perpendicular to the reach path). One open finger comes straight down on top of the object rim before the gripper starts closing at `step ~49`, blocking vertical descent (`dz` stalls at `+3.2 to +3.6 cm`) and knocking the object sideways by `1.2 to 1.6 cm`.
+   - Grouping all `Exp 03` episodes by horizontal offset when first entering `dz < +4.5 cm` (`rim_xy`):
+     - **Clean entry (`rim_xy < 1.5 cm`, `35` eps)**: **`88.6%` (`31/35`)** centered close (`< 1.5 cm`), **`85.7%` (`30/35`)** lifted (`> 2 cm`), **`37.1%` (`13/35`)** Strict Pass.
+     - **Rim-grazing (`1.5 <= rim_xy < 2.5 cm`, `38` eps)**: `47.4%` (`18/38`) centered close, `71.1%` (`27/38`) lifted, `13.2%` (`5/38`) Strict Pass.
+     - **Wide of rim (`rim_xy >= 2.5 cm`, `40` eps)**: **`15.0%` (`6/40`)** centered close, **`32.5%` (`13/40`)** lifted, **`7.5%` (`3/40`)** Strict Pass.
+3. **Why the Hand Arrives `2.1 to 2.8 cm` Off-Center at `dz = +4.5 cm`**:
+   - **Open-Loop Vision-to-Joint (`FK XY`) Error**: Although `aux_cam_pos_heads` localize the object `(X, Y)` to `0.60 cm`, those `12D` coordinates are not fed into `z_fused`, and Flow Matching trains only on joint-angle MSE rather than fingertip Cartesian error. Open-loop evaluation on the `150` training demos shows a **`1.70 cm` (`p90 = 2.64 cm`)** `FK XY` error at hover/descent (`Step 15 -> 30` and `Step 20 -> 35`), and **`3.11 cm`** at `Step 0 -> 15` in `Exp 03` (vs. `2.55 cm` in `Exp 02c` due to unconditioned $\mathcal{U}(0.80, 1.20)$ reach speed jitter).
+   - **Zero Horizontal Correction in Expert Demos During Descent**: In `_build_segments_v2`, `90%` of horizontal `(X, Y)` travel finishes during `approach_src` (`steps 0..28`, `0.452 cm/step`), while `descend_src` (`steps 28..42`, `0.104 cm/step`) drops straight down in `Z` from an already-centered hover (`xy = 1.0 cm`). The dataset contains zero corrective examples where the hand is at low `Z` (`dz = +3 to +6 cm`) and `2 cm` off-center horizontally.
+
+### 3. Inference Ablation: `temporal_ensemble_decay` Sweep (`0.05`, `0.15`, `0.30`, `0.50`) on `Exp 03` (`120` Episodes)
+Tested whether weighting newer action chunks more heavily (`decay > 0.05` in `TemporalEnsembler`, where `w_age = exp(-decay * age)`) improves close-range visual centering at the rim (`checkpoints/exp03_demo_v2/best_policy.pt`, `ode_steps = 5`):
+
+| Metric | `0.05` (Baseline) | `0.15` | `0.30` | `0.50` |
+| :--- | :---: | :---: | :---: | :---: |
+| **Rim Entry `< 1.5 cm` (`dz < +4.5 cm`)** | **`36 / 120` (`30.0%`)** | `34 / 120` (`28.3%`) | `21 / 120` (`17.5%`) | `10 / 120` (`8.3%`) |
+| **Mean / Median Rim `XY` (`cm`)** | **`2.51` / `2.12 cm`** | `2.55` / `2.23 cm` | `3.05` / `2.86 cm` | `3.49` / `3.07 cm` |
+| **Centered Grasp Close (`< 1.5 cm`)** | **`55 / 120` (`45.8%`)** | `51 / 120` (`42.5%`) | `33 / 120` (`27.5%`) | `23 / 120` (`19.2%`) |
+| *Train / Test Centered Close* | *`27 / 60`, `28 / 60`* | *`25 / 60`, `26 / 60`* | *`11 / 60`, `22 / 60`* | *`14 / 60`, `9 / 60`* |
+| **Mean / Median Close `XY` (`cm`)** | `2.54` / `1.76 cm` | **`2.33` / `1.74 cm`** | `2.97` / `2.27 cm` | `4.06` / `3.04 cm` |
+| **Mean Close Height `dz` (`cm`)** | `+1.61 cm` | `+1.55 cm` | `+1.55 cm` | `+2.12 cm` |
+| **Mean Close Step** | **`54.1`** | `58.2` | `73.1` | `88.2` |
+| **Stage 1: Reached (`< 2.0 cm`)** | **`108 / 120` (`90.0%`)** | `107 / 120` (`89.2%`) | `97 / 120` (`80.8%`) | `98 / 120` (`81.7%`) |
+| **Stage 2: Lifted (`> 2.0 cm`)** | **`69 / 120` (`57.5%`)** | `58 / 120` (`48.3%`) | `45 / 120` (`37.5%`) | `29 / 120` (`24.2%`) |
+| **Stage 3: Near Target (`< 6.0 cm`)** | **`45 / 120` (`37.5%`)** | `35 / 120` (`29.2%`) | `23 / 120` (`19.2%`) | `18 / 120` (`15.0%`) |
+| **Stage 4: Goal Only Pass** | **`21 / 120` (`17.5%`)** | `13 / 120` (`10.8%`) | `0 / 120` (`0.0%`) | `3 / 120` (`2.5%`) |
+| **STRICT PASS (All Constraints)** | **`21 / 120` (`17.5%`)** | `13 / 120` (`10.8%`) | `0 / 120` (`0.0%`) | `3 / 120` (`2.5%`) |
+| *Train / Test Strict Pass* | *`14 / 60`, `7 / 60`* | *`8 / 60`, `5 / 60`* | *`0 / 60`, `0 / 60`* | *`2 / 60`, `1 / 60`* |
+| *Task 0 / Task 1 / Task 2 Pass* | *`6` / `11` / `4`* | *`8` / `4` / `1`* | *`0` / `0` / `0`* | *`0` / `3` / `0`* |
+| `2a_premature_high_close` | **`23` (`19.2%`)** | `25` (`20.8%`) | `36` (`30.0%`) | `50` (`41.7%`) |
+| `4a_held_at_target_freeze` | **`3` (`2.5%`)** | `10` (`8.3%`) | `13` (`10.8%`) | `12` (`10.0%`) |
+
+* **Takeaway (Why `decay = 0.05` Is Optimal)**:
+  1. **Lookahead Overcomes Servo Tracking Lag**: Step `0` (`age = 0`) of each predicted chunk is anchored right next to the current lagging joint state `q_curr`. Putting heavy weight on `age = 0..2` (`decay >= 0.30`) commands targets barely ahead of the lagging servos (`step 35` stalls at `dz = +8.35 to +10.41 cm` instead of `+5.18 cm`, `Mean Close Step` stretches from `54.1` to `88.2`, and `4a_held_at_target_freeze` quadruples from `3` to `12`).
+  2. **Variance Reduction Over Flow ODE Noise**: Blending across all `16` overlapping chunks (`decay = 0.05`) averages out `16` independent Gaussian initial draws $x_0 \sim \mathcal{N}(0, I)$, whereas high decay (`0.30`, `0.50`) exposes single-chunk jitter and doubles `2a_premature_high_close` (`23 -> 50`).

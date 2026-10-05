@@ -53,6 +53,16 @@ def test_camera_projection_and_failure_diagnosis() -> None:
     )
     assert "failed grasp/lift" in msg_grasp
 
+    msg_off_center = diagnose_rollout_status(
+        constraints=base_constraints,
+        min_pinch_src_xy_cm=1.1,
+        max_src_lift_cm=0.0,
+        final_src_tgt_xy_cm=12.0,
+        grasp_close_xy_cm=3.4,
+        grasp_close_dz_cm=1.8,
+    )
+    assert "Closed off-center" in msg_off_center
+
     msg_target = diagnose_rollout_status(
         constraints=base_constraints,
         min_pinch_src_xy_cm=0.8,

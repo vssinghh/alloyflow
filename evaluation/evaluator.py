@@ -41,6 +41,9 @@ class EpisodeEvalResult:
     max_target_disp_cm: float
     target_tipped: bool
     mean_latency_ms: float
+    grasp_close_step: int | None = None
+    grasp_close_xy_cm: float | None = None
+    grasp_close_dz_cm: float | None = None
     gif_path: str | None = None
     strip_path: str | None = None
 
@@ -54,6 +57,8 @@ def diagnose_rollout_status(
     min_pinch_src_xy_cm: float,
     max_src_lift_cm: float,
     final_src_tgt_xy_cm: float,
+    grasp_close_xy_cm: float | None = None,
+    grasp_close_dz_cm: float | None = None,
 ) -> str:
     """Return a concise human-readable PASS or FAIL diagnosis string."""
     if constraints["all_constraints_passed"]:
@@ -71,6 +76,9 @@ def diagnose_rollout_status(
     if min_pinch_src_xy_cm > 3.0:
         return f"FAIL: Missed source reach (min_xy={min_pinch_src_xy_cm:.1f}cm)"
     if max_src_lift_cm < 0.8:
+        if grasp_close_xy_cm is not None and grasp_close_xy_cm >= 1.5:
+            dz_str = f", dz={grasp_close_dz_cm:+.1f}cm" if grasp_close_dz_cm is not None else ""
+            return f"FAIL: Closed off-center (close_xy={grasp_close_xy_cm:.1f}cm{dz_str})"
         return f"FAIL: Reached src ({min_pinch_src_xy_cm:.1f}cm), failed grasp/lift"
     return f"FAIL: Lifted (+{max_src_lift_cm:.1f}cm), missed target ({final_src_tgt_xy_cm:.1f}cm)"
 
@@ -165,6 +173,9 @@ class SimPolicyEvaluator:
 
         min_pinch_src_xy_cm = float("inf")
         max_src_z_cm = init_src_z_cm
+        grasp_close_step: int | None = None
+        grasp_close_xy_cm: float | None = None
+        grasp_close_dz_cm: float | None = None
         latencies_ms: list[float] = []
 
         cached_chunk: np.ndarray | None = None
@@ -231,10 +242,16 @@ class SimPolicyEvaluator:
             tgt_pos = self.env.data.body(tgt_bid).xpos
 
             cur_pinch_src_xy_cm = float(np.linalg.norm(pinch_pos[:2] - src_pos[:2])) * 100.0
+            cur_pinch_src_dz_cm = float(pinch_pos[2] - src_pos[2]) * 100.0
             cur_src_z_cm = float(src_pos[2]) * 100.0
             cur_src_tgt_xy_cm = float(np.linalg.norm(src_pos[:2] - tgt_pos[:2])) * 100.0
             min_pinch_src_xy_cm = min(min_pinch_src_xy_cm, cur_pinch_src_xy_cm)
             max_src_z_cm = max(max_src_z_cm, cur_src_z_cm)
+
+            if grasp_close_step is None and float(action_6d[5]) < 0.48:
+                grasp_close_step = int(step)
+                grasp_close_xy_cm = cur_pinch_src_xy_cm
+                grasp_close_dz_cm = cur_pinch_src_dz_cm
 
             cur_constraints = self.env.check_constraints(int(task_id))
             cur_succ = bool(cur_constraints["all_constraints_passed"])
@@ -296,6 +313,8 @@ class SimPolicyEvaluator:
             min_pinch_src_xy_cm=min_pinch_src_xy_cm,
             max_src_lift_cm=max_src_lift_cm,
             final_src_tgt_xy_cm=final_src_tgt_xy_cm,
+            grasp_close_xy_cm=grasp_close_xy_cm,
+            grasp_close_dz_cm=grasp_close_dz_cm,
         )
 
         saved_gif_path: str | None = None
@@ -336,6 +355,9 @@ class SimPolicyEvaluator:
             max_target_disp_cm=float(constraints["max_target_displacement_m"]) * 100.0,
             target_tipped=bool(constraints["target_tipped"]),
             mean_latency_ms=float(np.mean(latencies_ms)) if latencies_ms else 0.0,
+            grasp_close_step=grasp_close_step,
+            grasp_close_xy_cm=grasp_close_xy_cm,
+            grasp_close_dz_cm=grasp_close_dz_cm,
             gif_path=saved_gif_path,
             strip_path=saved_strip_path,
         )
@@ -452,10 +474,21 @@ class SimPolicyEvaluator:
                 passed = sum(1 for r in t_eps if r.all_constraints_passed)
                 total = len(t_eps)
                 rate = passed / float(max(total, 1))
+                close_xys = [r.grasp_close_xy_cm for r in t_eps if r.grasp_close_xy_cm is not None]
+                close_dzs = [r.grasp_close_dz_cm for r in t_eps if r.grasp_close_dz_cm is not None]
+                centered_closes = sum(
+                    1
+                    for r in t_eps
+                    if r.grasp_close_xy_cm is not None and r.grasp_close_xy_cm < 1.5
+                )
                 per_task[tid] = {
                     "passed": passed,
                     "total": total,
                     "strict_success_rate": rate,
+                    "centered_grasp_close_count": centered_closes,
+                    "centered_grasp_close_rate": centered_closes / float(max(total, 1)),
+                    "mean_grasp_close_xy_cm": float(np.mean(close_xys)) if close_xys else float("nan"),
+                    "mean_grasp_close_dz_cm": float(np.mean(close_dzs)) if close_dzs else float("nan"),
                     "mean_min_src_xy_cm": float(np.mean([r.min_pinch_src_xy_cm for r in t_eps])),
                     "mean_max_lift_cm": float(np.mean([r.max_src_lift_cm for r in t_eps])),
                     "mean_final_tgt_xy_cm": float(np.mean([r.final_src_tgt_xy_cm for r in t_eps])),
@@ -464,6 +497,9 @@ class SimPolicyEvaluator:
                     print(
                         f"  Task {tid} ({TASK_SPECS[tid].name}): "
                         f"{passed}/{total} ({rate * 100.0:.1f}%) | "
+                        f"centered_close={centered_closes}/{total} "
+                        f"(close_xy={per_task[tid]['mean_grasp_close_xy_cm']:.2f}cm, "
+                        f"close_dz={per_task[tid]['mean_grasp_close_dz_cm']:+.2f}cm) | "
                         f"mean_src_xy={per_task[tid]['mean_min_src_xy_cm']:.2f}cm | "
                         f"mean_lift=+{per_task[tid]['mean_max_lift_cm']:.2f}cm | "
                         f"mean_tgt_xy={per_task[tid]['mean_final_tgt_xy_cm']:.2f}cm"
@@ -471,15 +507,28 @@ class SimPolicyEvaluator:
             tot_passed = sum(1 for r in all_eps if r.all_constraints_passed)
             tot_count = len(all_eps)
             tot_rate = tot_passed / float(max(tot_count, 1))
+            tot_centered = sum(
+                1
+                for r in all_eps
+                if r.grasp_close_xy_cm is not None and r.grasp_close_xy_cm < 1.5
+            )
+            all_close_xys = [r.grasp_close_xy_cm for r in all_eps if r.grasp_close_xy_cm is not None]
+            all_close_dzs = [r.grasp_close_dz_cm for r in all_eps if r.grasp_close_dz_cm is not None]
             if verbose:
                 print(
                     f"--> {split_name.upper()} STRICT PASS TOTAL: "
-                    f"{tot_passed}/{tot_count} ({tot_rate * 100.0:.1f}%)"
+                    f"{tot_passed}/{tot_count} ({tot_rate * 100.0:.1f}%) | "
+                    f"CENTERED CLOSE (<1.5cm): {tot_centered}/{tot_count} "
+                    f"({tot_centered / float(max(tot_count, 1)) * 100.0:.1f}%)"
                 )
             return {
                 "passed": tot_passed,
                 "total": tot_count,
                 "strict_success_rate": tot_rate,
+                "centered_grasp_close_count": tot_centered,
+                "centered_grasp_close_rate": tot_centered / float(max(tot_count, 1)),
+                "mean_grasp_close_xy_cm": float(np.mean(all_close_xys)) if all_close_xys else float("nan"),
+                "mean_grasp_close_dz_cm": float(np.mean(all_close_dzs)) if all_close_dzs else float("nan"),
                 "per_task": per_task,
                 "episodes": [r.to_dict() for r in all_eps],
             }
