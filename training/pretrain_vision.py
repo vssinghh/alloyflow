@@ -35,7 +35,7 @@ def compute_layout_target_12d(
 
 def render_localization_dataset(
     out_path: str | Path = "data/loc_layouts_3000.npz",
-    demo_h5_path: str | Path = "data/sim_demos.h5",
+    demo_h5_path: str | Path = "data/sim_demos_v2.h5",
     num_layouts: int = 3000,
     base_seed: int = 50000,
     varied_arm_prob: float = 0.50,
@@ -131,7 +131,7 @@ def render_localization_dataset(
 
 
 def load_demo_frame0_validation(
-    demo_h5_path: str | Path = "data/sim_demos.h5",
+    demo_h5_path: str | Path = "data/sim_demos_v2.h5",
 ) -> dict[str, torch.Tensor]:
     """Load frame-0 images and exact 12D object XY targets from the 300 demos in sim_demos.h5."""
     dummy_env = SimEnv(include_rgb=False)
@@ -217,7 +217,7 @@ def evaluate_policy_localization(
 def pretrain_vision_encoders(
     policy: TaskConditionedVisionFlowPolicy,
     loc_npz_path: str | Path = "data/loc_layouts_3000.npz",
-    demo_h5_path: str | Path = "data/sim_demos.h5",
+    demo_h5_path: str | Path = "data/sim_demos_v2.h5",
     steps: int = 3000,
     batch_size: int = 64,
     lr: float = 1e-3,

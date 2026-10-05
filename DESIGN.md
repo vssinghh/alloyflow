@@ -75,7 +75,7 @@ alloyflow/                        # Repository Root
 ├── training/                     # Step 2: Model, Stage 1 pretraining & 4-mode training loop
 │   ├── __init__.py
 │   ├── config.py                 # Training hyperparameters
-│   ├── model.py                  # Vision Flow Matching policy + 4 parallel side-branch pos heads
+│   ├── model.py                  # Vision Flow Matching policy + 3 parallel side-branch pos heads
 │   ├── pretrain_vision.py        # Stage 1 3,000-scene layout generator & vision pretrainer
 │   ├── flow_matching.py          # Flow matching loss, co-supervised pos loss & ODE sampler
 │   ├── dataset.py                # HDF5 loader, 12D object XY labels & Sim+Real batch mixer
@@ -108,16 +108,16 @@ alloyflow/                        # Repository Root
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
    # Train on remote Colab GPU (default) and pull checkpoints to checkpoints/<run_name>/
-   ./scripts/train.sh exp03_v2_try1 --colab --mode sim_only --sim-data data/sim_demos_v2.h5 --pretrained-checkpoint checkpoints/exp02c_no_attn/pretrained_vision.pt
+   ./scripts/train.sh exp04_long_train_60ep --colab --mode sim_only --sim-data data/sim_demos_v2.h5 --pretrained-checkpoint checkpoints/exp02c_no_attn/pretrained_vision.pt
 
    # Or train locally on Mac GPU (MPS)
-   ./scripts/train.sh exp03_v2_try1 --local --mode sim_only --sim-data data/sim_demos_v2.h5
+   ./scripts/train.sh exp04_long_train_60ep --local --mode sim_only --sim-data data/sim_demos_v2.h5
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
    ```bash
-   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --benchmark --episodes 20
-   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+   uv run python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --benchmark --episodes 20
+   uv run python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --demos demo_0000,demo_0101,demo_0200
    ```
 4. **Run Tests**:
    ```bash
@@ -135,14 +135,14 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 
 ### 4.1 Simulation Data Collection (`--domain sim`)
 `collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) at 5 key poses (`Hover`, `Descend`, `Grasp & Lift`, `Move to Goal`, `Place & Release`) and interpolates smoothly in `6D` joint space so the arm follows a clean upward arc over tabletop clutter. It supports two trajectory profiles via `trajectory_version`:
-- **`trajectory_version = "v1"` (`data/sim_demos.h5`, default)**: Continuous 8-segment trajectory (`144` steps per episode) with `trim_stationary = True` during dataset loading.
-- **`trajectory_version = "v2"` (`data/sim_demos_v2.h5`)**: Adds flat-bottom grasping (`2 to 5` step open dwell at `grasp_z`, `close_in_place` at `grasp_z`, and `2 to 3` step closed hold before lifting), open-in-place target release at `place_z` (`2 to 4` step closed dwell, `open_in_place`, `2` step open hold, and open upward retreat with zero clamped-while-rising steps), and per-episode $\mathcal{U}(0.8, 1.2)$ segment timing jitter (`128 to 165` steps per episode). When loading `"v2"` HDF5 files, `RollingWindowDataset` automatically preserves intentional dwell frames (`trim_stationary = False`) and reads each episode's exact `lift_start_step`.
+- **`trajectory_version = "v2"` (`data/sim_demos_v2.h5`, current default training dataset)**: Uses flat-bottom grasping (`2 to 5` step open dwell at `grasp_z`, `close_in_place` at `grasp_z`, and `2 to 3` step closed hold before lifting), open-in-place target release at `place_z` (`2 to 4` step closed dwell, `open_in_place`, `2` step open hold, and open upward retreat with zero clamped-while-rising steps), and per-episode $\mathcal{U}(0.8, 1.2)$ segment timing jitter (`128 to 165` steps per episode). When loading `"v2"` HDF5 files, `RollingWindowDataset` automatically preserves intentional dwell frames (`trim_stationary = False`) and reads each episode's exact `lift_start_step`.
+- **`trajectory_version = "v1"` (`data/sim_demos.h5`, legacy)**: Continuous 8-segment trajectory (`144` steps per episode) with `trim_stationary = True` during dataset loading.
 
 * **Dataset Scale & Two-Step Randomization Plan (`100` demos per task, `300` total)**:
   1. **Object `(X, Y)` Positions**: Always randomized across the full reachable tabletop workspace on every episode.
   2. **Visual & Physical Domain Randomization (`--dr`)**:
      - First, we verify the planner and policy on **Clean Simulation** (`50` demos per task with fixed studio lighting and camera mounts) to confirm `90%+` task success.
-     - Next, we collect **`50` Domain-Randomized (`DR`) demos per task** (varying lighting direction, object/tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass `0.7x to 1.5x`), giving **`100` Sim demos per task (`300` total)** in `data/sim_demos.h5` (and `data/sim_demos_v2.h5` on the exact same `300` scene seeds).
+     - Next, we collect **`50` Domain-Randomized (`DR`) demos per task** (varying lighting direction, object/tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass `0.7x to 1.5x`), giving **`100` Sim demos per task (`300` total)** in `data/sim_demos_v2.h5` (and `data/sim_demos.h5` on the exact same `300` scene seeds).
 
 * **Mandatory Quality & Constraint Checks (Verified Before Saving Any Demo)**:
   Every simulated episode must pass 4 automated checks before it is written to `.h5` (failed seeds are skipped automatically):
@@ -213,11 +213,11 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 * **Stage 1 Loss**:
   $$\mathcal{L}_{\text{Stage 1}} = 1.0 \cdot \text{MSE}_{\text{overhead}} + 1.0 \cdot \text{MSE}_{\text{third\_person}} + 0.5 \cdot \text{MSE}_{\text{wrist}}$$
 
-#### Phase 2 of 3: Stage 2 Flow Matching Training + Co-Supervised Aux Position Loss (`20` Epochs)
+#### Phase 2 of 3: Stage 2 Flow Matching Training + Co-Supervised Aux Position Loss (`60` Epochs)
 
 ![Phase 2 of 3: Stage 2 Flow Matching Training](assets/stage2_training.png)
 
-* **All modules `[TRAINED]`**: Starts from the Stage 1 vision weights (or loads an existing `pretrained_vision.pt` via `--pretrained-checkpoint`) and trains the entire network (`camera_encoders`, `proprio_mlp`, `task_embedding`, `4-Block Flow ResMLP`, and the 3 parallel per-camera position heads) for `20` epochs (`batch_size = 128`, `lr = 5e-4`, `1,056,039` trainable parameters).
+* **All modules `[TRAINED]`**: Starts from the Stage 1 vision weights (or loads an existing `pretrained_vision.pt` via `--pretrained-checkpoint`, such as `checkpoints/exp02c_no_attn/pretrained_vision.pt`) and trains the entire network (`camera_encoders`, `proprio_mlp`, `task_embedding`, `4-Block Flow ResMLP`, and the 3 parallel per-camera position heads) for `60` epochs (`batch_size = 128`, cosine LR schedule from `lr = 5.0e-4` to `eta_min = 2.5e-5` over `60` epochs, `1,056,039` trainable parameters) on Colab GPU (`--colab`) or local Mac MPS (`--local`) via `scripts/train.sh`. Current baseline checkpoint: `checkpoints/exp04_long_train_60ep/best_policy.pt` trained on `data/sim_demos_v2.h5`.
 * **Direct Camera Concatenation & Training-Only Parallel Side Branches (Never in `z_fused`)**:
   - The 3 per-camera position heads (`aux_cam_pos_heads`) run **in parallel** (none feeds into another) and sit strictly in a training-only side branch (`predict_aux_positions`).
   - Their `12D` coordinate predictions **never** enter `z_fused`. Instead, the three `32D` camera tokens are concatenated directly in fixed slot order (`CAMERA_NAMES`) with `z_prop` and `z_task` to form `z_fused`:
@@ -233,7 +233,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 ![Phase 3 of 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
 
-* **Zero inference overhead**: During `predict_action_chunk`, all 3 position heads (`29,604` parameters) are completely ignored (`1,026,435` active inference parameters). The policy calls `encode_observations` once per `50 ms` control step to build $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$, integrates `Flow ResMLP` over `10` Euler ODE steps ($\Delta \tau = 0.1$), and blends overlapping `16 x 6` chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
+* **Zero inference overhead**: During `predict_action_chunk`, all 3 position heads (`29,604` parameters) are completely ignored (`1,026,435` active inference parameters). The policy calls `encode_observations` once per `50 ms` control step (`exec_horizon = 1`) to build $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$, integrates `Flow ResMLP` over `5` Euler ODE steps ($\Delta \tau = 0.2$, `ode_steps = 5`), and blends overlapping `16 x 6` chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$, `temporal_ensemble_decay = 0.05`). As shown in Study 03b (`EXPERIMENT_LOG.md`), `decay = 0.05` provides lookahead over servo tracking lag (whereas larger decay weights `age = 0..2` near the lagging current joint state and induces descent/target stalls) while averaging out `16` independent Gaussian ODE draws $x_0 \sim \mathcal{N}(0, I)$.
 
 #### Component Summary Across All 3 Phases
 
@@ -244,7 +244,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | **`Proprio MLP (6 -> 64D)`** | **Unused** | **`[TRAINED]`** from scratch | **Used** (frozen weights) |
 | **`3 Per-Camera Pos Heads`** | **`[TRAINED]`** (`w = 1.0, 1.0, 0.5`) | **`[TRAINED]`** (`w = 1.0, 1.0, 0.25`) | **Ignored** (not called) |
 | **`z_fused (192D)`** | Not built (only `3x 32D` `cam_tokens` built) | **Built** (`[tok_tp, tok_ov, tok_wr, z_prop, z_task]`) | **Built once per step** (`192D`) |
-| **`4-Block Flow ResMLP`** | **Unused** | **`[TRAINED]`** from scratch | **Used** (`10` Euler ODE steps) |
+| **`4-Block Flow ResMLP`** | **Unused** | **`[TRAINED]`** from scratch | **Used** (`5` Euler ODE steps at inference) |
 
 ### 5.2 Detailed Layer-by-Layer Specification
 
@@ -285,21 +285,21 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
    - **Target Action Chunk ($x_1$)**: Next `16` steps of `6D` joint commands `(16, 6)` (`0.8 s` at `20 Hz`), z-score normalized using `action_mean` and `action_std`. At episode boundaries (`t > T - 16`), steps beyond `T - 1` repeat `actions[T - 1]` so the robot holds its final retracted pose cleanly.
    - **Nonlinear Observation Conditioning (`obs_proj`)**: Projects $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ through a 2-layer nonlinear MLP (`Linear(192 -> 256) + LayerNorm(256) + SiLU + Linear(256 -> 256) + Dropout`) before summing with `act_proj` and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$).
    - **Stratified Flow Amortization (`K = 4`)**:
-     - Computes $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ **once** per minibatch through the 3 CNNs and evaluates the lightweight `ResMLP` across `K = 4` stratified flow timesteps $\tau_{i,k} = \frac{k + u_{i,k}}{4}$ for $k \in \{0, 1, 2, 3\}$ and $u_{i,k} \sim \mathcal{U}(0, 1)$.
+      - Computes $\mathbf{z}_{\text{fused}} \in \mathbb{R}^{192}$ **once** per minibatch through the 3 CNNs and evaluates the lightweight `ResMLP` across `K = 4` stratified flow timesteps $\tau_{i,k} = \frac{k + u_{i,k}}{4}$ for $k \in \{0, 1, 2, 3\}$ and $u_{i,k} \sim \mathcal{U}(0, 1)$.
    - **Straight-Line Interpolation, Velocity Loss & Validation Selection**:
-     - Samples $x_0 \sim \mathcal{N}(0, I)$, forms $x_\tau = (1 - \tau) x_0 + \tau x_1$, and trains $v_\theta(x_\tau, \tau \mid \mathbf{z}_{\text{fused}})$ to match $u_\tau = x_1 - x_0$ using dimension-weighted MSE with `gripper_weight = 2.5` on joint `5`.
-     - At the end of each epoch, evaluates deterministic 10-step Euler ODE action-chunk MSE (`val_ode_mse`) in `policy.eval()` mode on `val_samples_per_epoch = 512` transitions and saves the lowest-error model to `best_policy.pt`.
+      - Samples $x_0 \sim \mathcal{N}(0, I)$, forms $x_\tau = (1 - \tau) x_0 + \tau x_1$, and trains $v_\theta(x_\tau, \tau \mid \mathbf{z}_{\text{fused}})$ to match $u_\tau = x_1 - x_0$ using dimension-weighted MSE with `gripper_weight = 2.5` on joint `5`.
+      - At the end of each epoch, evaluates deterministic 10-step Euler ODE action-chunk MSE (`val_ode_mse`) in `policy.eval()` mode on `val_samples_per_epoch = 512` transitions and saves the lowest-error model to `best_policy.pt`.
    - **Closed-Loop Inference (`20 Hz`)**:
-     - Integrates $v_\theta$ from $\tau = 0 \to 1$ in `10` Euler steps ($\Delta \tau = 0.1$) and blends overlapping `16`-step predictions using **Temporal Ensembling** ($w_i = \exp(-0.05 \cdot i)$).
+      - Re-queries every control step (`exec_horizon = 1`), integrates $v_\theta$ from $\tau = 0 \to 1$ in `5` Euler steps ($\Delta \tau = 0.2$, `ode_steps = 5`), and blends overlapping `16`-step predictions using **Temporal Ensembling** ($w_i = \exp(-0.05 \cdot i)$, `temporal_ensemble_decay = 0.05`, validated in Study 03b to overcome servo tracking lag and suppress ODE draw variance).
 
 ### 5.3 The 4 Training Modes & Default Hyperparameters (`training/config.py`)
 
 | Mode Flag | Training Dataset(s) | Batch Sampling | Learning Rate | Normalization Stats (`norm_stats`) |
 | :--- | :--- | :--- | :---: | :--- |
-| **`sim_only`** | `data/sim_demos.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos.h5` & saved in checkpoint |
+| **`sim_only`** | `data/sim_demos_v2.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2.h5` & saved in checkpoint |
 | **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
-| **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
-| **`cotrain`** | `data/sim_demos.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
+| **`finetune`** | Pretrained `exp04_long_train_60ep` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
+| **`cotrain`** | `data/sim_demos_v2.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
 
 | Hyperparameter | Default Value | Purpose |
 | :--- | :---: | :--- |
@@ -316,20 +316,20 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | `shift_pad` / `keypoint_noise` | `4` / `0.01` | Random $\pm 4\text{ px}$ image shift and `0.01` training keypoint jitter. |
 | `proprio_noise_std` / `proprio_drop_prob` | `0.02` / `0.10` | Training Gaussian jitter on normalized $\tilde{\mathbf{q}}$ and `z_prop` dropout probability. |
 | `wrist_cam_drop_prob` / `dropout` | `0.05` / `0.05` | Wrist camera token dropout and `ResMLP` activation dropout. |
-| `batch_size` / `epochs` | `128` / `20` | `80` effective flow passes per sample (`20 * K`), AdamW (`wd = 1e-4`). |
-| `val_samples_per_epoch` | `512` | Validation samples used to compute eval-mode `val_ode_mse` for `best_policy.pt`. |
-| `ode_steps` / `temporal_ensemble_decay` | `10` / `0.05` | Euler ODE integration steps and $w_i = \exp(-0.05 \cdot i)$ blending. |
+| `batch_size` / `epochs` | `128` / `60` | `240` effective flow passes per sample (`60 * K`), AdamW (`wd = 1e-4`), cosine LR (`5e-4 -> 2.5e-5`). |
+| `val_samples_per_epoch` | `512` | Validation samples used to compute 10-step eval-mode `val_ode_mse` for `best_policy.pt`. |
+| `ode_steps` / `exec_horizon` / `temporal_ensemble_decay` | `5` / `1` / `0.05` | Closed-loop inference Euler ODE steps (`10` for `val_ode_mse`), single-step re-query, and $w_i = \exp(-0.05 \cdot i)$ blending (Study 03b). |
 
 ***
 
 ## 6. Closed-Loop Evaluation & Visual Diagnostics (`evaluation/`)
 
-`evaluation/evaluator.py` (`SimPolicyEvaluator`) and `evaluation/visualizer.py` (`RolloutVisualizer`) execute closed-loop physics rollouts in `SimEnv` at `20 Hz` (`max_steps = 280`, `14.0 s` horizon) and record first-pass task and constraint completion (`all_constraints_passed`).
+`evaluation/evaluator.py` (`SimPolicyEvaluator`) and `evaluation/visualizer.py` (`RolloutVisualizer`) execute closed-loop physics rollouts in `SimEnv` at `20 Hz` (`max_steps = 280`, `14.0 s` horizon, `ode_steps = 5`, `exec_horizon = 1`, `temporal_ensemble_decay = 0.05`) and record first-pass task and constraint completion (`all_constraints_passed`).
 
 ### 6.1 Train vs. Held-Out Test Split Protocol (`--benchmark`)
-Running `python -m evaluation --checkpoint <path> --benchmark --episodes 20` evaluates **`120` closed-loop episodes total**:
-1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds stored in `data/sim_demos.h5` (`seeds 1000..1549` for Task 0, `2000..2549` for Task 1, `3000..3549` for Task 2) to measure in-distribution closed-loop execution accuracy.
+Running `python -m evaluation --checkpoint checkpoints/exp04_long_train_60ep/best_policy.pt --benchmark --episodes 20` evaluates **`120` closed-loop episodes total**:
+1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds stored in `data/sim_demos_v2.h5` (`seeds 1000..1549` for Task 0, `2000..2549` for Task 1, `3000..3549` for Task 2) to measure in-distribution closed-loop execution accuracy.
 2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019` for Task 0, `10000..10019` for Task 1, `11000..11019` for Task 2) where all 4 objects spawn at novel tabletop positions never seen during training.
 
 ### 6.2 Automated Failure-Stage Diagnosis & Multi-Camera HUD GIFs
-Every episode returns an `EpisodeEvalResult` tracking closest pinch-to-source XY distance (`min_pinch_src_xy_cm`), maximum object lift (`max_src_lift_cm`), final object-to-target XY distance (`final_src_tgt_xy_cm`), bystander/target disturbance checks, and an automated failure classification (`PASS`, `Missed source reach`, `Failed grasp/lift`, `Missed target`, or `Bystander/Target disturbed`). When `--demos` or `--save-gif` is enabled, `RolloutVisualizer` saves both an animated multi-camera `.gif` and a 6-keyframe `.png` strip overlaying projected `[SRC]` and `[TGT]` markers, the predicted 16-step trajectory ribbon, and live joint telemetry.
+Every episode returns an `EpisodeEvalResult` tracking closest pinch-to-source XY distance (`min_pinch_src_xy_cm`), horizontal offset and vertical height at initial gripper close (`grasp_close_xy_cm`, `grasp_close_dz_cm`, `grasp_close_step`), maximum object lift (`max_src_lift_cm`), final object-to-target XY distance (`final_src_tgt_xy_cm`), bystander/target disturbance checks, and an automated failure classification (`PASS`, `Missed source reach`, `Closed off-center`, `Failed grasp/lift`, `Missed target`, or `Bystander/Target disturbed`). When `--demos` or `--save-gif` is enabled, `RolloutVisualizer` saves both an animated multi-camera `.gif` and a 6-keyframe `.png` strip overlaying projected `[SRC]` and `[TGT]` markers, the predicted 16-step trajectory ribbon, and live joint telemetry.

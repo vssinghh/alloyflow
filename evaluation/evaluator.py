@@ -88,7 +88,7 @@ class SimPolicyEvaluator:
 
     def __init__(
         self,
-        checkpoint_path: str | Path = "checkpoints/sim_only/best_policy.pt",
+        checkpoint_path: str | Path = "checkpoints/exp04_long_train_60ep/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
     ) -> None:
@@ -149,7 +149,7 @@ class SimPolicyEvaluator:
         spec = TASK_SPECS[int(task_id)]
         dom_str = "sim_dr" if domain_rand else "sim_clean"
         label = episode_label or f"task{task_id}_seed{seed}"
-        steps_ode = int(ode_steps if ode_steps is not None else self.config.ode_steps)
+        steps_ode = int(ode_steps if ode_steps is not None else 5)
 
         self.env.domain_rand = bool(domain_rand)
         obs = self.env.reset(task_id=int(task_id), seed=int(seed))
@@ -365,7 +365,7 @@ class SimPolicyEvaluator:
     def run_demo_case(
         self,
         demo_key: str = "demo_0000",
-        h5_path: str | Path = "data/sim_demos.h5",
+        h5_path: str | Path = "data/sim_demos_v2.h5",
         *,
         max_steps: int = 280,
         ode_steps: int | None = None,
@@ -412,7 +412,7 @@ class SimPolicyEvaluator:
         self,
         *,
         episodes_per_task: int = 20,
-        train_h5_path: str | Path = "data/sim_demos.h5",
+        train_h5_path: str | Path = "data/sim_demos_v2.h5",
         test_base_seed: int = 90000,
         domain_rand: bool = False,
         max_steps: int = 280,

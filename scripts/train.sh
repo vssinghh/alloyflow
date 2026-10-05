@@ -9,9 +9,9 @@ set -euo pipefail
 #   ./scripts/train.sh <run_name> [--colab | --local] [python -m training args...]
 #
 # Examples:
-#   ./scripts/train.sh exp02d_try1 --colab --mode sim_only
-#   ./scripts/train.sh exp02d_try1 --local --mode sim_only
-#   ./scripts/train.sh exp02d_smoke --colab --mode sim_only --epochs 5
+#   ./scripts/train.sh exp04_long_train_60ep --colab --mode sim_only
+#   ./scripts/train.sh exp04_long_train_60ep --local --mode sim_only
+#   ./scripts/train.sh exp04_smoke --colab --mode sim_only --epochs 5
 
 if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: $0 <run_name> [--colab | --local] [python -m training args...]"
@@ -21,8 +21,8 @@ if [[ $# -lt 1 || "$1" == "-h" || "$1" == "--help" ]]; then
     echo "  --local    Train on local Mac GPU (MPS) into checkpoints/<run_name>/"
     echo ""
     echo "Examples:"
-    echo "  $0 exp02d_try1 --colab --mode sim_only"
-    echo "  $0 exp02d_try1 --local --mode sim_only --epochs 20"
+    echo "  $0 exp04_long_train_60ep --colab --mode sim_only"
+    echo "  $0 exp04_long_train_60ep --local --mode sim_only --epochs 60"
     exit 0
 fi
 
@@ -179,7 +179,7 @@ import sys
 
 p = argparse.ArgumentParser(add_help=False)
 p.add_argument("--mode", default="sim_only")
-p.add_argument("--sim-data", default="data/sim_demos.h5")
+p.add_argument("--sim-data", default="data/sim_demos_v2.h5")
 p.add_argument("--real-data", default="data/real_demos.h5")
 p.add_argument("--pretrained-checkpoint", default="")
 args, _ = p.parse_known_args(sys.argv[1:])
