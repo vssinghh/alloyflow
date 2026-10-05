@@ -43,6 +43,9 @@ def write_episode_to_hdf5(
     grp.attrs["seed"] = int(episode_data.get("seed", episode_idx))
     grp.attrs["num_steps"] = num_steps
     grp.attrs["num_samples"] = num_steps
+    grp.attrs["trajectory_version"] = str(episode_data.get("trajectory_version", "v1"))
+    if "lift_start_step" in episode_data:
+        grp.attrs["lift_start_step"] = int(episode_data["lift_start_step"])
 
     grp.create_dataset(
         "actions",
@@ -76,6 +79,8 @@ def collect_sim_demos(
     split_clean_and_dr: bool = False,
     base_seed: int = SIM_TRAIN_BASE_SEED,
     max_attempts_Factor: int = 4,
+    trajectory_version: str = "v1",
+    reference_h5: str | Path | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Collect verified simulation demonstrations that pass all 4 constraint checks.
@@ -90,6 +95,9 @@ def collect_sim_demos(
             `domain_rand=True` (`sim_dr`), matching the 50 Clean + 50 DR design.
         base_seed: Starting RNG seed for reproducible spawns.
         max_attempts_Factor: Maximum seed attempts multiplier per required episode.
+        trajectory_version: Expert trajectory version ('v1' or 'v2').
+        reference_h5: Optional existing `.h5` dataset whose exact `(task_id, seed, domain)`
+            schedule should be re-collected.
         verbose: Whether to print progress updates.
     """
     out_file = Path(output_path)
@@ -97,41 +105,45 @@ def collect_sim_demos(
     tasks = [0, 1, 2] if task_ids is None else [int(t) for t in task_ids]
 
     env = SimEnv(domain_rand=domain_rand)
-    planner = SimExpertPlanner(env)
+    planner = SimExpertPlanner(env, trajectory_version=trajectory_version)
 
     total_saved = 0
     total_attempts = 0
     per_task_counts: dict[int, int] = {t: 0 for t in tasks}
+    failed_seeds: list[tuple[int, int, str, dict[str, Any]]] = []
+
+    ref_schedule: list[tuple[int, int, str]] | None = None
+    if reference_h5 is not None:
+        with h5py.File(reference_h5, "r") as rf:
+            rroot = rf.get("data", rf)
+            rkeys = sorted(k for k in rroot if k.startswith("demo_"))
+            ref_schedule = [
+                (
+                    int(rroot[k].attrs["task_id"]),
+                    int(rroot[k].attrs["seed"]),
+                    str(rroot[k].attrs.get("domain", "sim_clean")),
+                )
+                for k in rkeys
+                if int(rroot[k].attrs["task_id"]) in tasks
+            ]
 
     with h5py.File(out_file, "w") as h5f:
         h5f.attrs["num_cameras"] = len(CAMERA_NAMES)
         h5f.attrs["camera_names"] = list(CAMERA_NAMES)
         h5f.attrs["control_hz"] = env.control_hz
+        h5f.attrs["trajectory_version"] = trajectory_version
 
-        for tid in tasks:
-            saved_for_task = 0
-            attempt = 0
-            max_attempts = max(episodes_per_task * max_attempts_Factor, 10)
-            clean_target = episodes_per_task // 2 if split_clean_and_dr else (
-                0 if domain_rand else episodes_per_task
-            )
-
-            while saved_for_task < episodes_per_task and attempt < max_attempts:
-                use_dr = (
-                    (saved_for_task >= clean_target)
-                    if split_clean_and_dr
-                    else bool(domain_rand)
-                )
-                env.domain_rand = use_dr
-                domain_tag = "sim_dr" if use_dr else "sim_clean"
-
-                seed = base_seed + tid * 10_000 + attempt
-                attempt += 1
+        if ref_schedule is not None:
+            for tid, seed, domain_tag in ref_schedule:
+                env.domain_rand = (domain_tag == "sim_dr")
                 total_attempts += 1
-
-                ep_data = planner.generate_episode(task_id=tid, seed=seed, trim_dwell=True)
+                ep_data = planner.generate_episode(
+                    task_id=tid,
+                    seed=seed,
+                    trim_dwell=(trajectory_version == "v1"),
+                    trajectory_version=trajectory_version,
+                )
                 constraints = ep_data["constraints"]
-
                 if constraints["all_constraints_passed"] and ep_data["num_steps"] > 0:
                     write_episode_to_hdf5(
                         h5_file=h5f,
@@ -139,22 +151,69 @@ def collect_sim_demos(
                         episode_data=ep_data,
                         domain=domain_tag,
                     )
-                    saved_for_task += 1
                     total_saved += 1
-                    per_task_counts[tid] = saved_for_task
-                    if verbose and (saved_for_task % 10 == 0 or saved_for_task == episodes_per_task):
+                    per_task_counts[tid] = per_task_counts.get(tid, 0) + 1
+                    if verbose and (per_task_counts[tid] % 25 == 0):
                         print(
-                            f"[SimCollector] Task {tid} ({TASK_SPECS[tid].name}): "
-                            f"saved {saved_for_task}/{episodes_per_task} "
-                            f"(attempts={attempt}, domain={domain_tag})"
+                            f"[SimCollector-{trajectory_version}] Task {tid} ({TASK_SPECS[tid].name}): "
+                            f"saved {per_task_counts[tid]} (total={total_saved}/{len(ref_schedule)}, domain={domain_tag})",
+                            flush=True,
                         )
-
-            if saved_for_task < episodes_per_task:
-                env.close()
-                raise RuntimeError(
-                    f"Failed to collect {episodes_per_task} verified episodes for task {tid} "
-                    f"within {max_attempts} attempts (collected {saved_for_task})."
+                else:
+                    failed_seeds.append((tid, seed, domain_tag, constraints))
+        else:
+            for tid in tasks:
+                saved_for_task = 0
+                attempt = 0
+                max_attempts = max(episodes_per_task * max_attempts_Factor, 10)
+                clean_target = episodes_per_task // 2 if split_clean_and_dr else (
+                    0 if domain_rand else episodes_per_task
                 )
+
+                while saved_for_task < episodes_per_task and attempt < max_attempts:
+                    use_dr = (
+                        (saved_for_task >= clean_target)
+                        if split_clean_and_dr
+                        else bool(domain_rand)
+                    )
+                    env.domain_rand = use_dr
+                    domain_tag = "sim_dr" if use_dr else "sim_clean"
+
+                    seed = base_seed + tid * 10_000 + attempt
+                    attempt += 1
+                    total_attempts += 1
+
+                    ep_data = planner.generate_episode(
+                        task_id=tid,
+                        seed=seed,
+                        trim_dwell=(trajectory_version == "v1"),
+                        trajectory_version=trajectory_version,
+                    )
+                    constraints = ep_data["constraints"]
+
+                    if constraints["all_constraints_passed"] and ep_data["num_steps"] > 0:
+                        write_episode_to_hdf5(
+                            h5_file=h5f,
+                            episode_idx=total_saved,
+                            episode_data=ep_data,
+                            domain=domain_tag,
+                        )
+                        saved_for_task += 1
+                        total_saved += 1
+                        per_task_counts[tid] = saved_for_task
+                        if verbose and (saved_for_task % 10 == 0 or saved_for_task == episodes_per_task):
+                            print(
+                                f"[SimCollector] Task {tid} ({TASK_SPECS[tid].name}): "
+                                f"saved {saved_for_task}/{episodes_per_task} "
+                                f"(attempts={attempt}, domain={domain_tag})"
+                            )
+
+                if saved_for_task < episodes_per_task:
+                    env.close()
+                    raise RuntimeError(
+                        f"Failed to collect {episodes_per_task} verified episodes for task {tid} "
+                        f"within {max_attempts} attempts (collected {saved_for_task})."
+                    )
 
         h5f.attrs["num_episodes"] = total_saved
 
@@ -164,6 +223,7 @@ def collect_sim_demos(
         "total_saved": total_saved,
         "total_attempts": total_attempts,
         "per_task_counts": per_task_counts,
+        "failed_seeds": failed_seeds,
     }
 
 

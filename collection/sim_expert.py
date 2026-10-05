@@ -80,8 +80,11 @@ class SimExpertPlanner:
 
     SETTLE_STEPS: int = 10
 
-    def __init__(self, env: SimEnv) -> None:
+    def __init__(self, env: SimEnv, trajectory_version: str = "v1") -> None:
+        if trajectory_version not in ("v1", "v2"):
+            raise ValueError(f"Unsupported trajectory_version '{trajectory_version}', expected 'v1' or 'v2'.")
         self.env = env
+        self.trajectory_version = trajectory_version
         self._ik_data = mujoco.MjData(env.model)
         self._fixed_pad_id = mujoco.mj_name2id(
             env.model, mujoco.mjtObj.mjOBJ_GEOM, "fixed_jaw_pad"
@@ -153,7 +156,7 @@ class SimExpertPlanner:
     def _build_segments(
         self, task_id: int, q_home: np.ndarray, g_home: float
     ) -> list[tuple[np.ndarray, float, np.ndarray, float, int]]:
-        """Construct the 5-phase trajectory segments (q0, g0, q1, g1, n_steps)."""
+        """Construct the v1 5-phase trajectory segments (q0, g0, q1, g1, n_steps)."""
         spec = TASK_SPECS[task_id]
         src_pos = self.env.data.body(self.env._obj_body_ids[spec.source_object]).xpos.copy()
         tgt_pos = self.env.data.body(self.env._obj_body_ids[spec.target_object]).xpos.copy()
@@ -229,24 +232,139 @@ class SimExpertPlanner:
             (q_release, 0.72, q_retract, 0.75, 20),
         ]
 
+    def _build_segments_v2(
+        self, task_id: int, seed: int, q_home: np.ndarray, g_home: float
+    ) -> list[tuple[np.ndarray, float, np.ndarray, float, int]]:
+        """Construct v2 flat-bottom grasp, open-in-place release, and seeded timing-jitter segments."""
+        spec = TASK_SPECS[task_id]
+        src_pos = self.env.data.body(self.env._obj_body_ids[spec.source_object]).xpos.copy()
+        tgt_pos = self.env.data.body(self.env._obj_body_ids[spec.target_object]).xpos.copy()
+
+        grasp_z = float(src_pos[2]) + (0.004 if spec.source_object == "pen_holder" else 0.002)
+        place_z = (
+            float(tgt_pos[2]) + 0.056
+            if spec.goal_type == "place_inside"
+            else float(tgt_pos[2]) + 0.055
+        )
+
+        rng = np.random.default_rng(int(seed) * 31337 + int(task_id) * 997 + 7)
+
+        def jitter_steps(nom: int, min_s: int = 4) -> int:
+            scale = float(rng.uniform(0.8, 1.2))
+            return max(min_s, int(np.rint(nom * scale)))
+
+        dwell_grasp = int(rng.integers(2, 6))  # 2 to 5 steps open at bottom
+        hold_closed = int(rng.integers(2, 4))  # 2 to 3 steps closed at bottom
+        dwell_place = int(rng.integers(2, 5))  # 2 to 4 steps at place_z before opening
+        hold_open = 2                          # 2 steps open at place_z before retracting
+
+        q_hover_src = self.solve_ik(
+            np.array([src_pos[0], src_pos[1], 0.145]),
+            target_pitch=1.20,
+            grip_for_center=0.58,
+        )
+        q_grasp = self.solve_ik(
+            np.array([src_pos[0], src_pos[1], grasp_z]),
+            target_pitch=1.30,
+            grip_for_center=0.55,
+            q_init=q_hover_src,
+        )
+        # Close in place at grasp_z (compensating XY via grip_for_center=0.30, zero vertical rise)
+        q_clamp_in_place = self.solve_ik(
+            np.array([src_pos[0], src_pos[1], grasp_z]),
+            target_pitch=1.30,
+            grip_for_center=0.30,
+            q_init=q_grasp,
+        )
+        q_lift = self.solve_ik(
+            np.array([src_pos[0], src_pos[1], 0.155]),
+            target_pitch=1.20,
+            grip_for_center=0.30,
+            q_init=q_clamp_in_place,
+        )
+        q_hover_tgt = self.solve_ik(
+            np.array([tgt_pos[0], tgt_pos[1], 0.155]),
+            target_pitch=1.20,
+            grip_for_center=0.30,
+            q_init=q_lift,
+        )
+        q_place = self.solve_ik(
+            np.array([tgt_pos[0], tgt_pos[1], place_z]),
+            target_pitch=1.25,
+            grip_for_center=0.30,
+            q_init=q_hover_tgt,
+        )
+        # Open in place at place_z (compensating XY via grip_for_center=0.45, zero vertical rise)
+        q_release_in_place = self.solve_ik(
+            np.array([tgt_pos[0], tgt_pos[1], place_z]),
+            target_pitch=1.25,
+            grip_for_center=0.45,
+            q_init=q_place,
+        )
+        q_retract = self.solve_ik(
+            np.array([tgt_pos[0], tgt_pos[1], 0.155]),
+            target_pitch=1.20,
+            grip_for_center=0.58,
+            q_init=q_release_in_place,
+        )
+
+        n_approach = jitter_steps(22, min_s=16)
+        n_descend = jitter_steps(18, min_s=14)
+        n_close = jitter_steps(8, min_s=6)
+        n_lift = jitter_steps(20, min_s=15)
+        n_carry = jitter_steps(24, min_s=18)
+        n_lower = jitter_steps(18, min_s=14)
+        n_open = int(rng.integers(4, 6))  # 4 to 5 steps
+        n_retract = jitter_steps(18, min_s=14)
+
+        return [
+            (q_home, g_home, q_hover_src, 0.65, n_approach),
+            (q_hover_src, 0.65, q_grasp, 0.62, n_descend),
+            (q_grasp, 0.62, q_grasp, 0.60, dwell_grasp),
+            (q_grasp, 0.60, q_clamp_in_place, 0.05, n_close),
+            (q_clamp_in_place, 0.05, q_clamp_in_place, 0.05, hold_closed),
+            (q_clamp_in_place, 0.05, q_lift, 0.05, n_lift),
+            (q_lift, 0.05, q_hover_tgt, 0.05, n_carry),
+            (q_hover_tgt, 0.05, q_place, 0.05, n_lower),
+            (q_place, 0.05, q_place, 0.05, dwell_place),
+            (q_place, 0.38, q_release_in_place, 0.72, n_open),
+            (q_release_in_place, 0.72, q_release_in_place, 0.72, hold_open),
+            (q_release_in_place, 0.72, q_retract, 0.75, n_retract),
+        ]
+
     def generate_episode(
         self,
         task_id: int,
         seed: int,
         trim_dwell: bool = True,
         render_only_on_success: bool = True,
+        trajectory_version: str | None = None,
     ) -> dict[str, Any]:
         """Run one scripted 20 Hz trajectory and return observations, actions, and constraint report."""
+        ver = trajectory_version or self.trajectory_version
+        if ver not in ("v1", "v2"):
+            raise ValueError(f"Unsupported trajectory_version '{ver}', expected 'v1' or 'v2'.")
+
         prev_include_rgb = self.env.include_rgb
         if render_only_on_success:
             self.env.include_rgb = False
 
         obs = self.env.reset(task_id=task_id, seed=seed)
+        spec = TASK_SPECS[task_id]
+        src_bid = self.env._obj_body_ids[spec.source_object]
+        init_src_z = float(self.env.data.body(src_bid).xpos[2])
+
         q_home = obs["proprio"][:5].copy()
         g_home = float(obs["proprio"][5])
-        segments = self._build_segments(task_id=task_id, q_home=q_home, g_home=g_home)
+        if ver == "v2":
+            segments = self._build_segments_v2(
+                task_id=task_id, seed=seed, q_home=q_home, g_home=g_home
+            )
+        else:
+            segments = self._build_segments(task_id=task_id, q_home=q_home, g_home=g_home)
 
         raw_steps: list[dict[str, Any]] = []
+        lift_start_step: int | None = None
         for q0, g0, q1, g1, n_steps in segments:
             for s in range(1, n_steps + 1):
                 u = s / float(n_steps)
@@ -255,6 +373,10 @@ class SimExpertPlanner:
                 q_cmd = (1.0 - alpha) * q0 + alpha * q1
                 g_cmd = (1.0 - alpha) * g0 + alpha * g1
                 action = np.concatenate([q_cmd, [g_cmd]]).astype(np.float32)
+
+                cur_src_z = float(self.env.data.body(src_bid).xpos[2])
+                if lift_start_step is None and (cur_src_z - init_src_z) >= 0.002:
+                    lift_start_step = len(raw_steps)
 
                 step_record: dict[str, Any] = {
                     "proprio": obs["proprio"].copy(),
@@ -276,23 +398,26 @@ class SimExpertPlanner:
             self.env.step(hold_action)
 
         constraints = self.env.check_constraints(task_id=task_id)
-        steps = (
-            trim_stationary_frames(raw_steps, min_delta=1e-3, filter_interior=False)
-            if trim_dwell
-            else raw_steps
-        )
-
-        # Check that every consecutive step inside the kept trajectory has active motion
-        if len(steps) >= 2:
-            proprio_arr = np.stack([s["proprio"] for s in steps], axis=0)
-            action_arr = np.stack([s["action"] for s in steps], axis=0)
-            min_dq = float(np.min(np.linalg.norm(np.diff(proprio_arr, axis=0), axis=-1)))
-            min_da = float(np.min(np.linalg.norm(action_arr - proprio_arr, axis=-1)))
-            no_stationary_dwell = bool(
-                len(steps) == len(raw_steps) and min_dq >= 1e-3 and min_da >= 1e-3
-            )
+        if ver == "v2":
+            steps = raw_steps
+            no_stationary_dwell = bool(len(steps) >= 2 and len(steps) == len(raw_steps))
         else:
-            no_stationary_dwell = False
+            steps = (
+                trim_stationary_frames(raw_steps, min_delta=1e-3, filter_interior=False)
+                if trim_dwell
+                else raw_steps
+            )
+            # Check that every consecutive step inside the kept trajectory has active motion
+            if len(steps) >= 2:
+                proprio_arr = np.stack([s["proprio"] for s in steps], axis=0)
+                action_arr = np.stack([s["action"] for s in steps], axis=0)
+                min_dq = float(np.min(np.linalg.norm(np.diff(proprio_arr, axis=0), axis=-1)))
+                min_da = float(np.min(np.linalg.norm(action_arr - proprio_arr, axis=-1)))
+                no_stationary_dwell = bool(
+                    len(steps) == len(raw_steps) and min_dq >= 1e-3 and min_da >= 1e-3
+                )
+            else:
+                no_stationary_dwell = False
 
         constraints["no_stationary_dwell"] = no_stationary_dwell
         constraints["all_constraints_passed"] = bool(
@@ -329,6 +454,8 @@ class SimExpertPlanner:
             "task_id": int(task_id),
             "seed": int(seed),
             "num_steps": len(steps),
+            "trajectory_version": ver,
+            "lift_start_step": int(lift_start_step if lift_start_step is not None else 45),
             "constraints": constraints,
             "actions": actions_out,
             "proprio": proprio_out,

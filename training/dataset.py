@@ -163,6 +163,7 @@ class HDF5DemoDataset:
                 grp = root[k]
                 tid = int(grp.attrs.get("task_id", 0))
                 dom = str(grp.attrs.get("domain", "sim_clean"))
+                traj_ver = str(grp.attrs.get("trajectory_version", root.attrs.get("trajectory_version", "v1")))
                 buckets[(tid, dom)].append(k)
                 act_np = grp["actions"][:].astype(np.float32)
                 prop_np = grp["obs/proprio"][:].astype(np.float32)
@@ -170,7 +171,7 @@ class HDF5DemoDataset:
                     prop_np,
                     act_np,
                     chunk_size=self.chunk_size,
-                    trim_stationary=self.trim_stationary,
+                    trim_stationary=(self.trim_stationary and traj_ver != "v2"),
                 )
                 filt_h = build_proprio_history(
                     prop_np, filt_idx, lags=self.proprio_history_lags
@@ -247,9 +248,14 @@ class HDF5DemoDataset:
                     self.obj_xy[cursor:end] = torch.from_numpy(layout_12d).unsqueeze(0)
 
                     # Target object and non-source objects remain at spawn XY for all steps;
-                    # source object stays at spawn XY during initial approach/descend (raw_idx < 45)
+                    # source object stays at spawn XY until the episode's actual lift_start_step
+                    if "lift_start_step" in grp.attrs:
+                        lift_step = int(grp.attrs["lift_start_step"])
+                    else:
+                        closed_steps = np.where(filt_a[:, 5] <= 0.25)[0]
+                        lift_step = int(filt_idx[closed_steps[0]]) if len(closed_steps) > 0 else 45
                     mask_ep = np.ones((t_ep, 12), dtype=np.float32)
-                    moved = filt_idx >= 45
+                    moved = filt_idx >= lift_step
                     mask_ep[moved, 0:2] = 0.0
                     src_name = TASK_SPECS[tid].source_object
                     src_slot = OBJECT_NAMES.index(src_name)

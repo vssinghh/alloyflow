@@ -193,16 +193,40 @@ class PolicyTrainer:
             self.config.train_mode == "sim_only"
             and self.config.pretrain_loc_steps > 0
         ):
-            pretrain_loc_summary = pretrain_vision_encoders(
-                policy=self.policy,
-                loc_npz_path=self.config.loc_data_path,
-                demo_h5_path=self.config.sim_data_path,
-                steps=self.config.pretrain_loc_steps,
-                batch_size=64,
-                lr=1e-3,
-                device=self.device,
-                save_path=save_dir / "pretrained_vision.pt",
-            )
+            if self.config.pretrained_checkpoint and Path(self.config.pretrained_checkpoint).exists():
+                vis_ckpt_path = Path(self.config.pretrained_checkpoint)
+                raw_vis = torch.load(vis_ckpt_path, map_location="cpu", weights_only=False)
+                vis_sd = raw_vis.get("model_state_dict", raw_vis)
+                vis_prefixes = ("task_embedding.", "camera_encoders.", "aux_cam_pos_heads.", "obj_xy_mean", "obj_xy_std")
+                filtered_vis_sd = {k: v for k, v in vis_sd.items() if k.startswith(vis_prefixes)}
+                self.policy.load_state_dict(filtered_vis_sd, strict=False)
+                self.policy.to(self.device)
+                val_data = load_demo_frame0_validation(self.config.sim_data_path)
+                pretrain_loc_summary = evaluate_policy_localization(self.policy, val_data, self.device)
+                ov = pretrain_loc_summary["overhead_cam"]
+                tp = pretrain_loc_summary["third_person_cam"]
+                wr = pretrain_loc_summary["wrist_cam"]
+                print(
+                    f"[PretrainVis] Reused Stage 1 weights from {vis_ckpt_path} | "
+                    f"ov_src={ov['src_err_cm']:.2f}cm | tp_src={tp['src_err_cm']:.2f}cm | wr_src={wr['src_err_cm']:.2f}cm",
+                    flush=True,
+                )
+                torch.save(
+                    {"model_state_dict": self.policy.state_dict(), "val_localization": pretrain_loc_summary},
+                    save_dir / "pretrained_vision.pt",
+                )
+                self._set_seed(self.config.seed)
+            else:
+                pretrain_loc_summary = pretrain_vision_encoders(
+                    policy=self.policy,
+                    loc_npz_path=self.config.loc_data_path,
+                    demo_h5_path=self.config.sim_data_path,
+                    steps=self.config.pretrain_loc_steps,
+                    batch_size=64,
+                    lr=1e-3,
+                    device=self.device,
+                    save_path=save_dir / "pretrained_vision.pt",
+                )
             loc_replay_tensors = self._load_loc_replay_tensors()
             # Re-initialize Stage 2 AdamW optimizer after Stage 1 pretraining
             self.optimizer = torch.optim.AdamW(
