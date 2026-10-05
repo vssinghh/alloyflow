@@ -65,7 +65,7 @@ class AlloyTrainConfig:
 
     # Optimization schedule
     batch_size: int = 128
-    epochs: int = 20
+    epochs: int = 60
     lr: float = 5e-4
     finetune_lr: float = 1e-4
     weight_decay: float = 1e-4

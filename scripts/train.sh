@@ -160,7 +160,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [[ -x "$GDRIVE_BIN" ]]; then
-    "$GDRIVE_BIN" auth status >/dev/null 2>&1 || true
+    "$GDRIVE_BIN" readonly ls "$DRIVE_FOLDER_ID" >/dev/null 2>&1 || true
 fi
 
 if [[ ! -f "$GDRIVE_TOKEN_JSON" ]]; then
@@ -390,12 +390,29 @@ TMP_LOG="$LOCAL_SAVE_DIR/.remote_train.log"
 TMP_EXIT="$LOCAL_SAVE_DIR/.remote_train.exit"
 rm -f "$TMP_LOG" "$TMP_EXIT"
 
+FAIL_COUNT=0
+POLL_ITER=0
 while true; do
+    POLL_ITER=$((POLL_ITER + 1))
+    # Refresh Colab tunnel assignment and proxy token every 6th poll (~30s)
+    if (( POLL_ITER % 6 == 0 )); then
+        colab status -s "$SESSION_CLEAN" >/dev/null 2>&1 || true
+    fi
     if colab download -s "$SESSION_CLEAN" /content/train.log "$TMP_LOG" >/dev/null 2>&1; then
+        FAIL_COUNT=0
         TOTAL_LINES="$(wc -l < "$TMP_LOG" | tr -d ' ')"
         if [[ "$TOTAL_LINES" -gt "$PRINTED_LINES" ]]; then
             tail -n +"$((PRINTED_LINES + 1))" "$TMP_LOG"
             PRINTED_LINES="$TOTAL_LINES"
+            cp "$TMP_LOG" "$LOCAL_SAVE_DIR/train.log"
+            colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/best_policy.pt" "$LOCAL_SAVE_DIR/best_policy.pt" >/dev/null 2>&1 || true
+            colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/training_history.json" "$LOCAL_SAVE_DIR/training_history.json" >/dev/null 2>&1 || true
+        fi
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        if (( FAIL_COUNT >= 4 )); then
+            echo "[train] Error: Lost connection to Colab session '$SESSION_CLEAN' after $FAIL_COUNT failed polls."
+            exit 1
         fi
     fi
     if colab download -s "$SESSION_CLEAN" /content/train.exit "$TMP_EXIT" >/dev/null 2>&1; then
@@ -415,7 +432,8 @@ while true; do
         fi
         break
     fi
-    sleep 5
+    # Sleep 5s inside the remote Jupyter kernel via stdin pipe so the kernel WebSocket stays open and busy
+    echo "import time; time.sleep(5)" | colab exec -s "$SESSION_CLEAN" --timeout 30 >/dev/null 2>&1 || sleep 5
 done
 
 pull_remote_checkpoints
