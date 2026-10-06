@@ -408,10 +408,10 @@ class SimExpertPlanner:
                         mujoco.mj_kinematics(self.env.model, self._ik_data)
                         clean_pinch_z = float(self._ik_data.site(self.env._pinch_site_id).xpos[2])
                         dz = clean_pinch_z - float(self.env.data.body(src_bid).xpos[2])
-                        if dz >= 0.085:
+                        if dz >= 0.095:
                             w = 1.0
-                        elif dz >= 0.055:
-                            w = (dz - 0.055) / (0.085 - 0.055)
+                        elif dz >= 0.060:
+                            w = (dz - 0.060) / (0.095 - 0.060)
                         else:
                             w = 0.0
                         q_exec = q_cmd + w * dq_hover
