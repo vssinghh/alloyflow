@@ -81,8 +81,10 @@ class SimExpertPlanner:
     SETTLE_STEPS: int = 10
 
     def __init__(self, env: SimEnv, trajectory_version: str = "v1") -> None:
-        if trajectory_version not in ("v1", "v2"):
-            raise ValueError(f"Unsupported trajectory_version '{trajectory_version}', expected 'v1' or 'v2'.")
+        if trajectory_version not in ("v1", "v2", "v2_dart"):
+            raise ValueError(
+                f"Unsupported trajectory_version '{trajectory_version}', expected 'v1', 'v2', or 'v2_dart'."
+            )
         self.env = env
         self.trajectory_version = trajectory_version
         self._ik_data = mujoco.MjData(env.model)
@@ -342,8 +344,10 @@ class SimExpertPlanner:
     ) -> dict[str, Any]:
         """Run one scripted 20 Hz trajectory and return observations, actions, and constraint report."""
         ver = trajectory_version or self.trajectory_version
-        if ver not in ("v1", "v2"):
-            raise ValueError(f"Unsupported trajectory_version '{ver}', expected 'v1' or 'v2'.")
+        if ver not in ("v1", "v2", "v2_dart"):
+            raise ValueError(
+                f"Unsupported trajectory_version '{ver}', expected 'v1', 'v2', or 'v2_dart'."
+            )
 
         prev_include_rgb = self.env.include_rgb
         if render_only_on_success:
@@ -356,16 +360,35 @@ class SimExpertPlanner:
 
         q_home = obs["proprio"][:5].copy()
         g_home = float(obs["proprio"][5])
-        if ver == "v2":
+        is_dart = (ver == "v2_dart")
+        if ver in ("v2", "v2_dart"):
             segments = self._build_segments_v2(
                 task_id=task_id, seed=seed, q_home=q_home, g_home=g_home
             )
         else:
             segments = self._build_segments(task_id=task_id, q_home=q_home, g_home=g_home)
 
+        if is_dart:
+            rng_dart = np.random.default_rng(int(seed) * 31337 + int(task_id) * 997 + 99)
+            angle = float(rng_dart.uniform(0.0, 2.0 * np.pi))
+            mag = float(rng_dart.uniform(0.0, 0.025))  # 0 to 2.5 cm
+            delta = np.array([mag * np.cos(angle), mag * np.sin(angle)], dtype=np.float64)
+            q_hover_clean = segments[0][2]
+            src_xy = self.env.data.body(src_bid).xpos[:2].copy()
+            q_hover_pert = self.solve_ik(
+                np.array([src_xy[0] + delta[0], src_xy[1] + delta[1], 0.145]),
+                target_pitch=1.20,
+                grip_for_center=0.58,
+            )
+            dq_hover = q_hover_pert - q_hover_clean
+        else:
+            delta = np.zeros(2, dtype=np.float64)
+            mag = 0.0
+            dq_hover = np.zeros(5, dtype=np.float32)
+
         raw_steps: list[dict[str, Any]] = []
         lift_start_step: int | None = None
-        for q0, g0, q1, g1, n_steps in segments:
+        for seg_idx, (q0, g0, q1, g1, n_steps) in enumerate(segments):
             for s in range(1, n_steps + 1):
                 u = s / float(n_steps)
                 # Blended cosine-linear profile maintains non-zero velocity across waypoints
@@ -373,6 +396,30 @@ class SimExpertPlanner:
                 q_cmd = (1.0 - alpha) * q0 + alpha * q1
                 g_cmd = (1.0 - alpha) * g0 + alpha * g1
                 action = np.concatenate([q_cmd, [g_cmd]]).astype(np.float32)
+
+                if is_dart:
+                    if seg_idx == 0:
+                        # Ramp offset from 0 to full dq_hover at hover point
+                        q_exec = q_cmd + alpha * dq_hover
+                    elif seg_idx == 1:
+                        # Upper descent hold, decay linearly to 0 by pinch dz = 5.5 cm
+                        for j in range(5):
+                            self._ik_data.qpos[self.env._qpos_adrs[j]] = float(q_cmd[j])
+                        mujoco.mj_kinematics(self.env.model, self._ik_data)
+                        clean_pinch_z = float(self._ik_data.site(self.env._pinch_site_id).xpos[2])
+                        dz = clean_pinch_z - float(self.env.data.body(src_bid).xpos[2])
+                        if dz >= 0.085:
+                            w = 1.0
+                        elif dz >= 0.055:
+                            w = (dz - 0.055) / (0.085 - 0.055)
+                        else:
+                            w = 0.0
+                        q_exec = q_cmd + w * dq_hover
+                    else:
+                        q_exec = q_cmd
+                    exec_action = np.concatenate([q_exec, [g_cmd]]).astype(np.float32)
+                else:
+                    exec_action = action
 
                 cur_src_z = float(self.env.data.body(src_bid).xpos[2])
                 if lift_start_step is None and (cur_src_z - init_src_z) >= 0.002:
@@ -389,7 +436,7 @@ class SimExpertPlanner:
                     for cam_name in CAMERA_NAMES:
                         step_record[f"rgb_{cam_name}"] = obs[f"rgb_{cam_name}"].copy()
 
-                obs = self.env.step(action)
+                obs = self.env.step(exec_action)
                 raw_steps.append(step_record)
 
         # Step 10 extra settling frames (not saved in trajectory) to verify physical stability
@@ -398,7 +445,7 @@ class SimExpertPlanner:
             self.env.step(hold_action)
 
         constraints = self.env.check_constraints(task_id=task_id)
-        if ver == "v2":
+        if ver in ("v2", "v2_dart"):
             steps = raw_steps
             no_stationary_dwell = bool(len(steps) >= 2 and len(steps) == len(raw_steps))
         else:
@@ -455,6 +502,9 @@ class SimExpertPlanner:
             "seed": int(seed),
             "num_steps": len(steps),
             "trajectory_version": ver,
+            "perturbation": "dart" if is_dart else "none",
+            "delta_mag_cm": float(mag * 100.0) if is_dart else 0.0,
+            "delta_xy": [float(delta[0]), float(delta[1])] if is_dart else [0.0, 0.0],
             "lift_start_step": int(lift_start_step if lift_start_step is not None else 45),
             "constraints": constraints,
             "actions": actions_out,
