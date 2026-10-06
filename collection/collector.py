@@ -50,6 +50,10 @@ def write_episode_to_hdf5(
         grp.attrs["delta_mag_cm"] = float(episode_data["delta_mag_cm"])
     if "delta_xy" in episode_data:
         grp.attrs["delta_xy"] = np.asarray(episode_data["delta_xy"], dtype=np.float32)
+    if "delta_tgt_mag_cm" in episode_data:
+        grp.attrs["delta_tgt_mag_cm"] = float(episode_data["delta_tgt_mag_cm"])
+    if "delta_tgt_xy" in episode_data:
+        grp.attrs["delta_tgt_xy"] = np.asarray(episode_data["delta_tgt_xy"], dtype=np.float32)
     if "lift_start_step" in episode_data:
         grp.attrs["lift_start_step"] = int(episode_data["lift_start_step"])
 

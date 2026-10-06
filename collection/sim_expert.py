@@ -81,9 +81,9 @@ class SimExpertPlanner:
     SETTLE_STEPS: int = 10
 
     def __init__(self, env: SimEnv, trajectory_version: str = "v1") -> None:
-        if trajectory_version not in ("v1", "v2", "v2_dart"):
+        if trajectory_version not in ("v1", "v2", "v2_dart", "v2_dart_full"):
             raise ValueError(
-                f"Unsupported trajectory_version '{trajectory_version}', expected 'v1', 'v2', or 'v2_dart'."
+                f"Unsupported trajectory_version '{trajectory_version}', expected 'v1', 'v2', 'v2_dart', or 'v2_dart_full'."
             )
         self.env = env
         self.trajectory_version = trajectory_version
@@ -344,9 +344,9 @@ class SimExpertPlanner:
     ) -> dict[str, Any]:
         """Run one scripted 20 Hz trajectory and return observations, actions, and constraint report."""
         ver = trajectory_version or self.trajectory_version
-        if ver not in ("v1", "v2", "v2_dart"):
+        if ver not in ("v1", "v2", "v2_dart", "v2_dart_full"):
             raise ValueError(
-                f"Unsupported trajectory_version '{ver}', expected 'v1', 'v2', or 'v2_dart'."
+                f"Unsupported trajectory_version '{ver}', expected 'v1', 'v2', 'v2_dart', or 'v2_dart_full'."
             )
 
         prev_include_rgb = self.env.include_rgb
@@ -356,12 +356,20 @@ class SimExpertPlanner:
         obs = self.env.reset(task_id=task_id, seed=seed)
         spec = TASK_SPECS[task_id]
         src_bid = self.env._obj_body_ids[spec.source_object]
+        tgt_bid = self.env._obj_body_ids[spec.target_object]
         init_src_z = float(self.env.data.body(src_bid).xpos[2])
+        init_tgt_z = float(self.env.data.body(tgt_bid).xpos[2])
+        place_z = (
+            init_tgt_z + 0.056
+            if spec.goal_type == "place_inside"
+            else init_tgt_z + 0.055
+        )
 
         q_home = obs["proprio"][:5].copy()
         g_home = float(obs["proprio"][5])
-        is_dart = (ver == "v2_dart")
-        if ver in ("v2", "v2_dart"):
+        is_dart = ver in ("v2_dart", "v2_dart_full")
+        is_dart_full = (ver == "v2_dart_full")
+        if ver in ("v2", "v2_dart", "v2_dart_full"):
             segments = self._build_segments_v2(
                 task_id=task_id, seed=seed, q_home=q_home, g_home=g_home
             )
@@ -381,10 +389,34 @@ class SimExpertPlanner:
                 grip_for_center=0.58,
             )
             dq_hover = q_hover_pert - q_hover_clean
+
+            if is_dart_full:
+                angle_tgt = float(rng_dart.uniform(0.0, 2.0 * np.pi))
+                mag_tgt = float(rng_dart.uniform(0.0, 0.025))  # 0 to 2.5 cm
+                delta_tgt = np.array(
+                    [mag_tgt * np.cos(angle_tgt), mag_tgt * np.sin(angle_tgt)],
+                    dtype=np.float64,
+                )
+                q_hover_tgt_clean = segments[6][2]
+                tgt_xy = self.env.data.body(tgt_bid).xpos[:2].copy()
+                q_hover_tgt_pert = self.solve_ik(
+                    np.array([tgt_xy[0] + delta_tgt[0], tgt_xy[1] + delta_tgt[1], 0.155]),
+                    target_pitch=1.20,
+                    grip_for_center=0.30,
+                    q_init=q_hover_tgt_clean,
+                )
+                dq_hover_tgt = q_hover_tgt_pert - q_hover_tgt_clean
+            else:
+                delta_tgt = np.zeros(2, dtype=np.float64)
+                mag_tgt = 0.0
+                dq_hover_tgt = np.zeros(5, dtype=np.float32)
         else:
             delta = np.zeros(2, dtype=np.float64)
             mag = 0.0
             dq_hover = np.zeros(5, dtype=np.float32)
+            delta_tgt = np.zeros(2, dtype=np.float64)
+            mag_tgt = 0.0
+            dq_hover_tgt = np.zeros(5, dtype=np.float32)
 
         raw_steps: list[dict[str, Any]] = []
         lift_start_step: int | None = None
@@ -402,19 +434,50 @@ class SimExpertPlanner:
                         # Ramp offset from 0 to full dq_hover at hover point
                         q_exec = q_cmd + alpha * dq_hover
                     elif seg_idx == 1:
-                        # Upper descent hold, decay linearly to 0 by pinch dz = 5.5 cm
                         for j in range(5):
                             self._ik_data.qpos[self.env._qpos_adrs[j]] = float(q_cmd[j])
                         mujoco.mj_kinematics(self.env.model, self._ik_data)
                         clean_pinch_z = float(self._ik_data.site(self.env._pinch_site_id).xpos[2])
-                        dz = clean_pinch_z - float(self.env.data.body(src_bid).xpos[2])
-                        if dz >= 0.095:
-                            w = 1.0
-                        elif dz >= 0.060:
-                            w = (dz - 0.060) / (0.095 - 0.060)
+                        dz = clean_pinch_z - init_src_z
+                        if is_dart_full:
+                            if dz >= 0.095:
+                                cap = 0.025
+                            elif dz >= 0.045:
+                                cap = 0.002 + (0.025 - 0.002) * (dz - 0.045) / (0.095 - 0.045)
+                            elif dz >= 0.036:
+                                cap = 0.002 * (dz - 0.036) / (0.045 - 0.036)
+                            else:
+                                cap = 0.0
+                            eff_mag = min(mag, cap)
+                            w = float(eff_mag / mag) if mag > 1e-8 else 0.0
                         else:
-                            w = 0.0
+                            if dz >= 0.095:
+                                w = 1.0
+                            elif dz >= 0.060:
+                                w = (dz - 0.060) / (0.095 - 0.060)
+                            else:
+                                w = 0.0
                         q_exec = q_cmd + w * dq_hover
+                    elif is_dart_full and seg_idx == 6:
+                        cur_src_z_now = float(self.env.data.body(src_bid).xpos[2])
+                        if (cur_src_z_now - init_src_z) >= 0.030:
+                            q_exec = q_cmd + alpha * dq_hover_tgt
+                        else:
+                            q_exec = q_cmd
+                    elif is_dart_full and seg_idx == 7:
+                        for j in range(5):
+                            self._ik_data.qpos[self.env._qpos_adrs[j]] = float(q_cmd[j])
+                        mujoco.mj_kinematics(self.env.model, self._ik_data)
+                        clean_pinch_z = float(self._ik_data.site(self.env._pinch_site_id).xpos[2])
+                        h_above_place = clean_pinch_z - place_z
+                        top_h = 0.155 - place_z
+                        if h_above_place <= 0.015:
+                            w_tgt = 0.0
+                        elif h_above_place >= top_h:
+                            w_tgt = 1.0
+                        else:
+                            w_tgt = float((h_above_place - 0.015) / (top_h - 0.015))
+                        q_exec = q_cmd + w_tgt * dq_hover_tgt
                     else:
                         q_exec = q_cmd
                     exec_action = np.concatenate([q_exec, [g_cmd]]).astype(np.float32)
@@ -445,7 +508,7 @@ class SimExpertPlanner:
             self.env.step(hold_action)
 
         constraints = self.env.check_constraints(task_id=task_id)
-        if ver in ("v2", "v2_dart"):
+        if ver in ("v2", "v2_dart", "v2_dart_full"):
             steps = raw_steps
             no_stationary_dwell = bool(len(steps) >= 2 and len(steps) == len(raw_steps))
         else:
@@ -497,14 +560,17 @@ class SimExpertPlanner:
             actions_out = np.zeros((0, 6), dtype=np.float32)
             proprio_out = np.zeros((0, 6), dtype=np.float32)
 
+        pert_label = "dart_full" if is_dart_full else ("dart" if is_dart else "none")
         episode_data: dict[str, Any] = {
             "task_id": int(task_id),
             "seed": int(seed),
             "num_steps": len(steps),
             "trajectory_version": ver,
-            "perturbation": "dart" if is_dart else "none",
+            "perturbation": pert_label,
             "delta_mag_cm": float(mag * 100.0) if is_dart else 0.0,
             "delta_xy": [float(delta[0]), float(delta[1])] if is_dart else [0.0, 0.0],
+            "delta_tgt_mag_cm": float(mag_tgt * 100.0) if is_dart_full else 0.0,
+            "delta_tgt_xy": [float(delta_tgt[0]), float(delta_tgt[1])] if is_dart_full else [0.0, 0.0],
             "lift_start_step": int(lift_start_step if lift_start_step is not None else 45),
             "constraints": constraints,
             "actions": actions_out,

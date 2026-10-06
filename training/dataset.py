@@ -171,7 +171,10 @@ class HDF5DemoDataset:
                     prop_np,
                     act_np,
                     chunk_size=self.chunk_size,
-                    trim_stationary=(self.trim_stationary and traj_ver not in ("v2", "v2_dart")),
+                    trim_stationary=(
+                        self.trim_stationary
+                        and traj_ver not in ("v2", "v2_dart", "v2_dart_full")
+                    ),
                 )
                 filt_h = build_proprio_history(
                     prop_np, filt_idx, lags=self.proprio_history_lags
