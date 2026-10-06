@@ -23,10 +23,10 @@ class AlloyTrainConfig:
 
     # Training mode & dataset paths
     train_mode: str = "sim_only"
-    sim_data_path: str = "data/sim_demos_v2.h5"
+    sim_data_path: str = "data/sim_demos_v2_dart.h5"
     real_data_path: str = "data/real_demos.h5"
     pretrained_checkpoint: str | None = None
-    default_finetune_checkpoint: str = "checkpoints/exp04_long_train_60ep/best_policy.pt"
+    default_finetune_checkpoint: str = "checkpoints/exp06_dart/best_policy.pt"
     save_dir: str = ""
     real_ratio: float = 0.5
 

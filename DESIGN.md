@@ -108,16 +108,16 @@ alloyflow/                        # Repository Root
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
    # Train on remote Colab GPU (--colab) or local Mac GPU (--local)
-   ./scripts/train.sh sim_only --colab --mode sim_only
-   ./scripts/train.sh sim_only --local --mode sim_only
+   ./scripts/train.sh exp06_dart --colab --mode sim_only
+   ./scripts/train.sh exp06_dart --local --mode sim_only
 
    # Co-train on 50% Sim + 50% Real
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
    ```bash
-   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --benchmark --episodes 20
-   uv run python -m evaluation --checkpoint checkpoints/sim_only/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+   uv run python -m evaluation --checkpoint checkpoints/exp06_dart/best_policy.pt --benchmark --episodes 20
+   uv run python -m evaluation --checkpoint checkpoints/exp06_dart/best_policy.pt --demos demo_0000,demo_0101,demo_0200
    ```
 4. **Run Tests**:
    ```bash
@@ -134,12 +134,13 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 - **Camera Images**: Three `128x128` RGB images (`uint8`) per step.
 
 ### 4.1 Simulation Data Collection (`--domain sim`)
-`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) across 5 stages (`trajectory_version = "v2"` in `data/sim_demos_v2.h5`):
-1. **Hover & Descend**: Move above the source object and lower the open gripper (`0.75`) down to grasp height.
-2. **Close in Place**: Pause at the bottom for `2 to 5` steps, close the gripper (`0.75 -> 0.08`) while stationary, and hold for `2 to 3` steps before lifting.
-3. **Lift & Carry**: Lift the object in a clean upward arc over tabletop clutter to the target bowl or cube.
-4. **Open in Place & Retract**: Pause at the target for `2 to 4` steps, open the gripper (`0.08 -> 0.75`) while stationary, and retract upward with open jaws.
-5. **Speed Variation ($\pm 20\%$)**: Scale segment speeds by $\mathcal{U}(0.8, 1.2)$ on each episode (`128 to 165` total steps) so the policy learns to trigger actions from visual cues rather than memorizing a fixed step timer.
+`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) across 6 mechanisms (`trajectory_version = "v2_dart"` in `data/sim_demos_v2_dart.h5`):
+1. **Hover & Descend**: Move above the source object and lower the open gripper (`0.65 -> 0.62`) down to grasp height.
+2. **DART-Style Recovery Perturbations (`perturbation = "dart"`)**: Each episode draws a horizontal offset $\delta$ (`direction` $\sim \mathcal{U}(0^\circ, 360^\circ)$, `magnitude` $\sim \mathcal{U}(0, 2.5\text{ cm})$). The executed arm path ramps from `0` at home to full $\delta$ at hover, holds through upper descent, and decays linearly to `0` by pinch height $dz = 5.5\text{ cm}$ above the object center, while recording the unperturbed clean `v2` IK joint targets as `actions[t]`. This teaches the policy to steer back onto the centered grasp column during descent.
+3. **Close in Place**: Pause at the bottom for `4` nominal steps, close the gripper (`0.60 -> 0.05`) while stationary over `8` nominal steps, and hold for `4` nominal steps before lifting.
+4. **Lift & Carry**: Lift the object in a clean upward arc over tabletop clutter to the target bowl or cube.
+5. **Open in Place & Retract**: Pause at the target for `3` nominal steps, open the gripper (`0.05 -> 0.65`) while stationary, and retract upward with open jaws.
+6. **Speed Variation ($\pm 20\%$)**: Scale segment speeds by $\mathcal{U}(0.8, 1.2)$ on each episode so the policy learns to trigger actions from visual cues rather than memorizing a fixed step timer.
 
 * **Dataset Scale & Domain Randomization (`100` demos per task, `300` total)**:
   - **Clean Simulation (`50` demos per task, `150` total)**: Randomized object `(X, Y)` positions across the table with fixed studio lighting and camera mounts.
@@ -158,14 +159,15 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 2. **Follower Arm (Motor Torque On)**: The follower arm copies the leader arm's `6` joint positions in real time while the script records the follower's actual joint positions, the commanded joint targets, and the 3 USB camera frames.
 3. **Keyboard Controls**: Press `SPACE` to start and stop recording an episode, or `r` (`BACKSPACE`) to discard a failed attempt. We collect **`20` demos per task (`60` total)** into `data/real_demos.h5`.
 
-### 4.3 HDF5 File Format (`data/sim_demos_v2.h5` & `data/real_demos.h5`)
+### 4.3 HDF5 File Format (`data/sim_demos_v2_dart.h5` & `data/real_demos.h5`)
 ```text
 <domain>_demos.h5
 ├── attrs:
 │   ├── num_episodes: N
 │   ├── num_cameras: 3
 │   ├── control_hz: 20
-│   ├── trajectory_version: "v2"
+│   ├── trajectory_version: "v2_dart"
+│   ├── perturbation: "dart"
 │   └── camera_names: ["third_person_cam", "overhead_cam", "wrist_cam"]
 └── demo_0000/
     ├── attrs:
@@ -174,8 +176,11 @@ Both simulation and real-world collection save data in the exact same `.h5` file
     │   ├── domain: "sim_clean" | "sim_dr" | "real"
     │   ├── seed: int
     │   ├── num_steps: T
-    │   └── lift_start_step: int
-    ├── actions                        # float32 (T, 6) (commanded joint targets)
+    │   ├── lift_start_step: int
+    │   ├── perturbation: "dart"
+    │   ├── delta_mag_cm: float
+    │   └── delta_xy: float32 (2,)
+    ├── actions                        # float32 (T, 6) (clean v2 joint targets)
     └── obs/
         ├── proprio                    # float32 (T, 6) (current joint positions)
         ├── rgb_third_person_cam       # uint8   (T, 128, 128, 3)
@@ -239,10 +244,10 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 | Mode Flag | Training Dataset(s) | Batch Sampling | Learning Rate | Normalization Stats (`norm_stats`) |
 | :--- | :--- | :--- | :---: | :--- |
-| **`sim_only`** | `data/sim_demos_v2.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2.h5` & saved in checkpoint |
+| **`sim_only`** | `data/sim_demos_v2_dart.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2_dart.h5` & saved in checkpoint |
 | **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
 | **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
-| **`cotrain`** | `data/sim_demos_v2.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
+| **`cotrain`** | `data/sim_demos_v2_dart.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
 
 | Hyperparameter | Default Value | Purpose |
 | :--- | :---: | :--- |
@@ -265,7 +270,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 ### 6.1 Benchmark Split (`120` Episodes Total)
 Running `python -m evaluation --checkpoint <path> --benchmark --episodes 20` evaluates **`120` episodes**:
-1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds from `data/sim_demos_v2.h5` (`seeds 1000..1549`, `2000..2549`, `3000..3549`) to test in-distribution accuracy.
+1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds from `data/sim_demos_v2_dart.h5` (`seeds 1000..1549`, `2000..2549`, `3000..3549`) to test in-distribution accuracy.
 2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019`, `10000..10019`, `11000..11019`) with novel object placements.
 
 ### 6.2 Core Funnel Metrics & Diagnostic GIFs
