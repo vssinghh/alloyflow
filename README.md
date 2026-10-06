@@ -37,13 +37,13 @@ uv run python -m collection --domain sim --task all --episodes 100
 uv run python -m collection --domain real --task 0 --episodes 20
 
 # 2. Train policy (Colab GPU or local Mac MPS; modes: sim_only | real_only | finetune | cotrain)
-./scripts/train.sh exp06_dart --colab --mode sim_only
-./scripts/train.sh exp06_dart --local --mode sim_only
+./scripts/train.sh exp07_dart_full --colab --mode sim_only
+./scripts/train.sh exp07_dart_full --local --mode sim_only
 uv run python -m training --mode cotrain --real-ratio 0.5
 
 # 3. Evaluate policy (120-episode benchmark or per-demo diagnostic GIFs)
-uv run python -m evaluation --checkpoint checkpoints/exp06_dart/best_policy.pt --benchmark --episodes 20
-uv run python -m evaluation --checkpoint checkpoints/exp06_dart/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --benchmark --episodes 20
+uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --demos demo_0000,demo_0101,demo_0200
 
 # 4. Run unit tests
 uv run pytest

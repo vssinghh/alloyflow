@@ -16,7 +16,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/exp06_dart/best_policy.pt",
+        default="checkpoints/exp07_dart_full/best_policy.pt",
         help="Path to trained policy checkpoint (.pt).",
     )
     parser.add_argument(
@@ -28,7 +28,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--h5-path",
         type=str,
-        default="data/sim_demos_v2_dart.h5",
+        default="data/sim_demos_v2_dart_full.h5",
         help="Path to HDF5 dataset when --demos is specified.",
     )
     parser.add_argument(

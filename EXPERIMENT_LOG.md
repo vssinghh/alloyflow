@@ -21,7 +21,8 @@ Each experiment is evaluated on **`120` closed-loop episodes** (`60` training se
 | **Exp 03 (`exp03_demo_v2`)** | `v2` demos (`data/sim_demos_v2.h5`): flat-bottom grasp, open-in-place release, timing jitter | `108 / 120` (`90.0%`) | `69 / 120` (`57.5%`) | `14 / 60` (`23.3%`) | `7 / 60` (`11.7%`) | `21 / 120` (`17.5%`) | Fixes target release freezes and deepens grasps, but 20 epochs leaves the policy undertrained |
 | **Exp 04 (`exp04_long_train_60ep`)** | Trained `3x` longer (`20 -> 60` epochs) on `v2` demos | `116 / 120` (`96.7%`) | `103 / 120` (`85.8%`) | `31 / 60` (`51.7%`) | `22 / 60` (`36.7%`) | `53 / 120` (`44.2%`) | Centered grasps jump `46% -> 73%` and task success more than doubles (`17.5% -> 44.2%`) |
 | **Exp 05 (`exp05_wide_jaw`, rejected)** | Wider gripper opening during approach/descent (`0.65 -> 0.85`, `data/sim_demos_v3.h5`) | `96 / 120` (`80.0%`) | `74 / 120` (`61.7%`) | `21 / 60` (`35.0%`) | `21 / 60` (`35.0%`) | `42 / 120` (`35.0%`) | Single-hinge geometry shifts jaw center `14.9 mm` sideways during close, causing side-swiping misses |
-| **Exp 06 (`exp06_dart`)** | **DART recovery demos (`data/sim_demos_v2_dart.h5`): $\delta \sim \mathcal{U}(0, 2.5\text{ cm})$ hover offset with clean `v2` labels** | **`116 / 120` (`96.7%`)** | **`103 / 120` (`85.8%`)** | **`36 / 60` (`60.0%`)** | **`26 / 60` (`43.3%`)** | **`62 / 120` (`51.7%`)** | **Hand corrects on descent (`2.43 -> 0.83 cm` error), rim blocks drop (`51 -> 43`), and total pass reaches `51.7%`** |
+| **Exp 06 (`exp06_dart`)** | DART source recovery demos (`data/sim_demos_v2_dart.h5`): $\delta \sim \mathcal{U}(0, 2.5\text{ cm})$ hover offset with clean `v2` labels | `116 / 120` (`96.7%`) | `103 / 120` (`85.8%`) | `36 / 60` (`60.0%`) | `26 / 60` (`43.3%`) | `62 / 120` (`51.7%`) | Hand corrects on descent (`2.43 -> 0.83 cm` error), rim blocks drop (`51 -> 43`), and total pass reaches `51.7%` |
+| **Exp 07 (`exp07_dart_full`)** | **Full source + target DART demos (`data/sim_demos_v2_dart_full.h5`): source DART down to `dz = 3.5 cm` + target carry/lower DART** | **`118 / 120` (`98.3%`)** | **`104 / 120` (`86.7%`)** | **`40 / 60` (`66.7%`)** | **`26 / 60` (`43.3%`)** | **`66 / 120` (`55.0%`)** | **Target release error drops (`1.11 -> 0.90 cm`), target placement failures drop `-35%` (`20 -> 13`), `Task 1` jumps `42.5% -> 62.5%`, and total pass reaches `55.0%`** |
 
 ***
 
@@ -296,3 +297,65 @@ In `Exp 04`, the hand arrived `2.08 cm` (median) off the expert path at the top 
 ### 4. What to Try Next
 1. **Target placement and rim bounce (`4b + 4c = 25 / 58` failures)**: Now that `93 / 120 (77.5%)` of episodes reach the target zone, `25` episodes fail right at release (`18` bounce off the bowl/cube rim `4b`, and `7` nudge the target receptacle `4c`). Applying the same DART recovery principle to the **target hover and lower segment** can teach the policy to center over the bowl and Rubik's cube before releasing.
 2. **Scale demonstration coverage on unseen test layouts (`60.0%` Train vs. `43.3%` Test)**: Expanding simulation demos beyond `100` per task can further close the `16.7`-point train-to-test gap on `Task 1` and `Task 2`.
+
+***
+
+## Experiment 07: Full Source + Target DART Recovery Demonstrations (`exp07_dart_full`)
+
+* **Commit / Checkpoint**: `54bc98c` | `checkpoints/exp07_dart_full/best_policy.pt`
+
+### 1. Hypothesis
+In `Exp 06`, source-only DART stopped correcting at pinch height $dz = 5.5\text{ cm}$ (`1.5 cm` above the `4.0 cm` cup rim) and left the carry and target-lower segments unperturbed (`20` placement failures among the `82` episodes that reached within `3.0 cm` of the target). We hypothesized that:
+1. Extending source DART deeper (`<= 0.2 cm` at $dz = 4.5\text{ cm}$ and `0` by $dz = 3.5\text{ cm}$) would provide corrective labels closer to the cup rim.
+2. Adding an independent target DART perturbation $\delta_{\text{tgt}} \sim \mathcal{U}(0, 2.5\text{ cm})$ that ramps in during carry (after the lifted source clears `3.0 cm` above the table) to full at `hover_tgt` and decays linearly to `0` by `1.5 cm` above the final placement height (`place_z`), while recording clean `v2` action labels (`data/sim_demos_v2_dart_full.h5`), would teach closed-loop target centering and cut release errors and placement failures.
+
+### 2. Changes
+* **Full Source + Target DART Perturbation ([`collection/sim_expert.py`](./collection/sim_expert.py), [`collection/collector.py`](./collection/collector.py))**:
+  - Added `trajectory_version = "v2_dart_full"` (`perturbation = "dart_full"`) and collected `data/sim_demos_v2_dart_full.h5` on the exact same `300` scene seeds (`300 / 300 = 100.0%` first-attempt expert success rate, `42,977` samples).
+  - **Source DART**: Sampled $\delta_{\text{src}} \sim \mathcal{U}(0, 2.5\text{ cm})$, ramped from `0` at home to full at `hover_src` (`median = 1.19 cm`), capped linear decay during descent so physical offset is `<= 0.2 cm` (`median = 0.149 cm`) at $dz = 4.5\text{ cm}$ and `< 0.1 cm` (`median = 0.043 cm`) by $dz = 3.5\text{ cm}$, with `0.0000 cm` label-vs-executed difference below $dz = 3.5\text{ cm}$.
+  - **Target DART**: Sampled independent $\delta_{\text{tgt}} \sim \mathcal{U}(0, 2.5\text{ cm})$, held `0` during lift until source lift $\ge 3.0\text{ cm}$, ramped to full at `hover_tgt` (`median = 1.14 cm` off-path, `median |label - exec| = 1.13 cm`), and decayed linearly during lower to `< 0.1 cm` (`median = 0.036 cm`) by `src_bottom_above_place_cm = 1.5 cm`, with `0.0000 cm` label-vs-executed difference below `1.5 cm`.
+* **Dataset & Training ([`training/dataset.py`](./training/dataset.py), [`training/config.py`](./training/config.py))**: Preserved stationary dwell frames (`trim_stationary = False` for `"v2_dart_full"`). Trained `60` epochs on Colab GPU (`seed 42`) from `checkpoints/exp02c_no_attn/pretrained_vision.pt`.
+
+### 3. Results
+
+#### 1. Target Placement Correction (`hover_tgt` $\to$ `release`, Episodes Reaching `<= 3.0 cm` of Target)
+
+| Group / Task | Split | `Exp 06` (`hover_tgt` $\to$ `release`, `median (p75)`) | **`Exp 07` (`hover_tgt` $\to$ `release`, `median (p75)`)** | Release Error Change |
+| :--- | :--- | :---: | :---: | :---: |
+| **Overall** | **ALL** | `1.64 (2.59)` $\to$ `1.11 (1.58) cm` `[n=82]` | **`1.55 (2.09)` $\to$ `0.90 (1.38) cm` `[n=79]`** | **`-0.21 cm (-18.9%)`** |
+| | **PASS** | `1.28 (1.83)` $\to$ `0.89 (1.28) cm` `[n=62]` | **`1.25 (1.75)` $\to$ `0.76 (1.07) cm` `[n=66]`** | **`-0.13 cm (-14.6%)`** |
+| **`Task 0`** (`pen_holder -> bowl`) | **ALL** | `1.37 (1.86)` $\to$ `0.66 (1.18) cm` `[n=33]` | `1.38 (1.89)` $\to$ `0.90 (1.23) cm` `[n=27]` | `+0.24 cm` |
+| **`Task 1`** (`cup -> bowl`) | **ALL** | `1.98 (2.85)` $\to$ `1.33 (2.15) cm` `[n=28]` | **`1.69 (2.92)` $\to$ `1.07 (1.40) cm` `[n=31]`** | **`-0.26 cm` (`p75 -34.9%`)** |
+| **`Task 2`** (`cup -> cube`) | **ALL** | `1.29 (2.85)` $\to$ `1.31 (1.93) cm` `[n=21]` | **`1.09 (1.83)` $\to$ `0.75 (1.14) cm` `[n=21]`** | **`-0.56 cm (-42.7%)`** |
+
+#### 2. Closed-Loop Funnel, Placement Failures & Task Success (`Exp 06` vs. `Exp 07`)
+
+| Metric (`120` Episodes: `60` Train + `60` Test) | Exp 06 (`v2_dart`, Source Only) | **Exp 07 (`v2_dart_full`, Source + Target)** | Delta (`07 - 06`) |
+| :--- | :---: | :---: | :---: |
+| **Validation ODE Error (`val_ode_mse` on clean `v2`)** | `0.00234` | **`0.00247`** (`0.00234` on `v2_dart_full`) | `+0.00013` |
+| **Reached Object (`< 2.0 cm`)** | `116 / 120 (96.7%)` | **`118 / 120 (98.3%)`** | **`+2 (+1.7 pp)`** |
+| **Source Descent Correction (`hover -> close` med `XY`)** | `2.43` $\to$ `0.83 cm` | **`2.36` $\to$ `0.83 cm`** (`Task 1`: `0.90 -> 0.85 cm`) | Tied overall (`-0.05 cm` on `Task 1`) |
+| **`BLOCKED` Grasps (`Total`: `Fixed / Moving / Nbr`)** | `43 / 120` (`23 / 19 / 1`) | `47 / 120` (`26 / 21 / 0`; `Task 1`: **`18 -> 15`**) | `+4` (`-3` on `Task 1`, `0` neighbor) |
+| **Lifted Object (`> 2.0 cm`: `Deep / Shallow`)** | `103 / 120` (`63` deep / `40` shallow) | **`104 / 120`** (`63` deep / `41` shallow; `Task 1`: **`33 -> 38`**) | **`+1` overall (`+5` on `Task 1`)** |
+| **Target-Arrival Conversion (`Pass / Reached <= 3 cm`)** | `62 / 82 (75.6%)` (`20` fails) | **`66 / 79 (83.5%)` (`13` fails)** | **`+7.9 pp (-35.0%` placement fails)** |
+| **Target/Bystander Pushed or Tipped (`4c`)** | `7 / 120` (`6` at target `<= 3 cm`) | **`3 / 120` (`2` at target `<= 3 cm`)** | **`-4 (-57.1%)`** |
+| **Rim Bounce / Source Tipped at Release (`4b`)** | `18 / 120` | **`14 / 120`** | **`-4 (-22.2%)`** |
+| **Task 0 (`pick_pen_holder_to_bowl`, `40` eps)** | `30 / 40 (75.0%)` | `24 / 40 (60.0%)` | `-6 (-15.0 pp)` |
+| **Task 1 (`pick_cup_to_bowl`, `40` eps)** | `17 / 40 (42.5%)` | **`25 / 40 (62.5%)`** | **`+8 (+20.0 pp)`** |
+| **Task 2 (`stack_cup_on_cube`, `40` eps)** | `15 / 40 (37.5%)` | **`17 / 40 (42.5%)`** | **`+2 (+5.0 pp)`** |
+| **Task Success: Train Split (`60` eps)** | `36 / 60 (60.0%)` | **`40 / 60 (66.7%)`** | **`+4 (+6.7 pp)`** |
+| **Task Success: Test Split (`60` eps)** | `26 / 60 (43.3%)` | **`26 / 60 (43.3%)`** | `0 (0.0 pp)` |
+| **Task Success: Combined (`120` eps)** | `62 / 120 (51.7%)` | **`66 / 120 (55.0%)`** | **`+4 (+3.3 pp, +17 / -13 flips)`** |
+
+* **What worked**:
+  - **Target descent actively centers the held object before release**: Among episodes reaching within `3.0 cm` of the target, median release error dropped from `1.11 cm` to **`0.90 cm`** (`0.89 -> 0.76 cm` on pass episodes). On `Task 2` (`stack_cup_on_cube`), where `Exp 06` had zero correction during target lower (`1.29 -> 1.31 cm`), `Exp 07` cuts error by **`-42.7%`** (`1.09 -> 0.75 cm`).
+  - **Target placement failures dropped by `-35%` (`20 -> 13`)**: Target/bystander knockovers (`4c`) fell from `7` to **`3`**, rim bounces (`4b`) fell from `18` to **`14`**, and target-arrival conversion rose from `75.6%` to **`83.5%`**.
+  - **Cup tasks (`Task 1 + Task 2`) surged by `+10` passes**: `Task 1` (`pick_cup_to_bowl`) jumped **`+20.0` points** (`17/40 = 42.5%` $\to$ **`25/40 = 62.5%`**, with lifted episodes rising `33 -> 38/40` and `BLOCKED` dropping `18 -> 15`), and `Task 2` rose from `37.5%` to **`42.5%`**.
+* **Why `Task 0` dropped `-6` while `Task 1 + Task 2` gained `+10` (Rim Height Geometry)**:
+  - Source DART parameterized $dz$ relative to the object center (`init_src_z`), decaying to `0` at $dz = 3.5\text{ cm}$. For the `4.0 cm` tall cup (`Task 1, 2`), jaw tips cross the top rim at `pinch dz = 3.16 cm`, so the correction finishes cleanly above the cup rim. For the `7.0 cm` tall pen holder (`Task 0`), jaw tips cross the top rim at **`pinch dz = 4.66 cm`**, where the fixed-$dz$ schedule still had up to `0.26 cm` of residual perturbation right at rim entry.
+* **Decision**: **Accepted as latest hero baseline (`checkpoints/exp07_dart_full/best_policy.pt`, `66 / 120 = 55.0%`)**.
+
+### 4. What to Try Next
+1. **Reference source DART $dz$ to the object's top rim (`dz_rim = pinch_z - top_rim_z`)**: Decaying source DART to `0` at `1.5 cm` above each object's top rim (`dz = 5.0 cm` for the `7.0 cm` pen holder, `dz = 3.5 cm` for the `4.0 cm` cup) should recover the `75.0%` `Task 0` pass rate from `Exp 06` while keeping the `62.5%` `Task 1` and `42.5%` `Task 2` gains from `Exp 07`.
+2. **Scale demonstration coverage (`66.7%` Train vs. `43.3%` Test)**: Increasing unique scene layouts per task will directly target the `23.4`-point train-to-test generalization gap.
+
