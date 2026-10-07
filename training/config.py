@@ -54,7 +54,7 @@ class AlloyTrainConfig:
     num_flow_samples: int = 4
     gripper_weight: float = 2.5
     shift_pad: int = 4
-    dropout: float = 0.05
+    dropout: float = 0.0
     keypoint_noise: float = 0.01
     proprio_noise_std: float = 0.02
     proprio_drop_prob: float = 0.10
@@ -69,8 +69,6 @@ class AlloyTrainConfig:
     epochs: int = 60
     lr: float = 5e-4
     finetune_lr: float = 1e-4
-    cooldown_epochs: int = 5
-    cooldown_lr: float = 5e-5
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
 
