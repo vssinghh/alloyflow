@@ -108,15 +108,14 @@ def classify_grasp_steps(steps_75: list[dict[str, Any]]) -> tuple[str, str]:
     return grasp_cls, first_pad
 
 
-def _benchmark_worker(args: tuple[str, str, int, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _benchmark_worker(args: tuple[str, str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Worker process for parallel benchmark evaluation."""
-    ckpt_path, device_str, obs_dropout_mc_k, jobs = args
+    ckpt_path, device_str, jobs = args
     if device_str == "cpu":
         torch.set_num_threads(1)
     evaluator = SimPolicyEvaluator(
         checkpoint_path=ckpt_path,
         device=device_str,
-        obs_dropout_mc_k=obs_dropout_mc_k,
     )
     out: list[dict[str, Any]] = []
     try:
@@ -168,7 +167,6 @@ class SimPolicyEvaluator:
         checkpoint_path: str | Path = "checkpoints/exp08b_cooldown_k0/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
-        obs_dropout_mc_k: int = 0,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.policy, self.config, self.ckpt_meta = load_policy_checkpoint(
@@ -176,7 +174,6 @@ class SimPolicyEvaluator:
         )
         self.policy.eval()
         self.device = next(self.policy.parameters()).device
-        self.obs_dropout_mc_k = int(obs_dropout_mc_k)
         self.matcher = ConditionalFlowMatcher(self.config)
         self.env = SimEnv(domain_rand=False, include_rgb=True)
         self._fk_data = mujoco.MjData(self.env.model)
@@ -220,7 +217,6 @@ class SimPolicyEvaluator:
         gt_actions: np.ndarray | None = None,
         max_steps: int = 280,
         ode_steps: int | None = None,
-        obs_dropout_mc_k: int | None = None,
         seed_offset: int = 0,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
@@ -236,9 +232,6 @@ class SimPolicyEvaluator:
         dom_str = "sim_dr" if domain_rand else "sim_clean"
         label = episode_label or f"task{task_id}_seed{seed}"
         steps_ode = int(ode_steps if ode_steps is not None else 5)
-        mc_k = int(
-            obs_dropout_mc_k if obs_dropout_mc_k is not None else self.obs_dropout_mc_k
-        )
 
         self.env.domain_rand = bool(domain_rand)
         obs = self.env.reset(task_id=int(task_id), seed=int(seed))
@@ -296,7 +289,6 @@ class SimPolicyEvaluator:
                         ode_steps=steps_ode,
                         clip_to_limits=True,
                         return_aux=True,
-                        obs_dropout_mc_k=mc_k,
                     )
                     cached_kp = {
                         cam: kp_t[0].detach().cpu().numpy()
@@ -312,7 +304,6 @@ class SimPolicyEvaluator:
                         ode_steps=steps_ode,
                         clip_to_limits=True,
                         return_aux=False,
-                        obs_dropout_mc_k=mc_k,
                     )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 latencies_ms.append(latency_ms)
@@ -496,7 +487,6 @@ class SimPolicyEvaluator:
         *,
         max_steps: int = 280,
         ode_steps: int | None = None,
-        obs_dropout_mc_k: int | None = None,
         seed_offset: int = 0,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
@@ -527,7 +517,6 @@ class SimPolicyEvaluator:
             gt_actions=gt_actions,
             max_steps=max_steps,
             ode_steps=ode_steps,
-            obs_dropout_mc_k=obs_dropout_mc_k,
             seed_offset=seed_offset,
             exec_horizon=exec_horizon,
             use_temporal_ensemble=use_temporal_ensemble,
@@ -548,7 +537,6 @@ class SimPolicyEvaluator:
         domain_rand: bool = False,
         max_steps: int = 280,
         ode_steps: int | None = None,
-        obs_dropout_mc_k: int | None = None,
         seed_offset: int = 0,
         num_workers: int = 1,
         exec_horizon: int = 1,
@@ -559,9 +547,6 @@ class SimPolicyEvaluator:
         """Run strict evaluation on both training seeds and held-out test seeds (>=20 per task)."""
         n_per_task = max(1, int(episodes_per_task))
         bench_ode_steps = int(ode_steps if ode_steps is not None else 5)
-        mc_k = int(
-            obs_dropout_mc_k if obs_dropout_mc_k is not None else self.obs_dropout_mc_k
-        )
         train_seeds_by_task: dict[int, list[int]] = {0: [], 1: [], 2: []}
         target_dom = "sim_dr" if domain_rand else "sim_clean"
 
@@ -589,7 +574,7 @@ class SimPolicyEvaluator:
             if verbose:
                 print(
                     f"\n=== [{split_name.upper()} SPLIT] ({n_per_task} seeds/task, "
-                    f"domain={target_dom}, mc_k={mc_k}, seed_offset={seed_offset}, "
+                    f"domain={target_dom}, seed_offset={seed_offset}, "
                     f"strict all_constraints_passed) ==="
                 )
 
@@ -604,7 +589,6 @@ class SimPolicyEvaluator:
                             "episode_label": f"{split_name}_t{tid}_s{s}",
                             "max_steps": max_steps,
                             "ode_steps": bench_ode_steps,
-                            "obs_dropout_mc_k": mc_k,
                             "seed_offset": seed_offset,
                             "exec_horizon": exec_horizon,
                             "use_temporal_ensemble": use_temporal_ensemble,
@@ -616,7 +600,7 @@ class SimPolicyEvaluator:
             if num_workers > 1:
                 nw = min(int(num_workers), len(jobs))
                 worker_args = [
-                    (str(self.checkpoint_path), str(self.device), mc_k, jobs[i::nw])
+                    (str(self.checkpoint_path), str(self.device), jobs[i::nw])
                     for i in range(nw)
                 ]
                 with mp.get_context("spawn").Pool(nw) as pool:
@@ -726,7 +710,6 @@ class SimPolicyEvaluator:
             "checkpoint": str(self.checkpoint_path),
             "domain": target_dom,
             "episodes_per_task": n_per_task,
-            "obs_dropout_mc_k": mc_k,
             "seed_offset": int(seed_offset),
             "overall_passed": overall_passed,
             "overall_total": overall_total,

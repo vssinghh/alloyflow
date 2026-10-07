@@ -154,7 +154,6 @@ class ConditionalFlowMatcher:
         clip_to_limits: bool = True,
         return_aux: bool = False,
         generator: torch.Generator | None = None,
-        obs_dropout_mc_k: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, Any]]:
         """Integrate v_theta from tau = 0.0 to 1.0 using Euler ODE steps and unnormalize."""
         was_training = policy.training
@@ -164,11 +163,6 @@ class ConditionalFlowMatcher:
             b = proprio.shape[0]
             device = proprio.device
             steps = int(ode_steps if ode_steps is not None else self.config.ode_steps)
-            mc_k = int(
-                obs_dropout_mc_k
-                if obs_dropout_mc_k is not None
-                else getattr(self.config, "obs_dropout_mc_k", 0)
-            )
             dt = 1.0 / float(max(steps, 1))
 
             if isinstance(task_id, int):
@@ -189,39 +183,12 @@ class ConditionalFlowMatcher:
                 generator=generator,
             )
 
-            if mc_k > 0:
-                policy.obs_dropout.train()
-                if b == 1:
-                    z_mc = z_fused.expand(mc_k, -1)
-                else:
-                    z_mc = z_fused.unsqueeze(1).expand(b, mc_k, -1).reshape(b * mc_k, -1)
-
             for step_idx in range(steps):
                 t_val = float(step_idx) * dt
-                if mc_k > 0:
-                    if b == 1:
-                        tau_mc = torch.full((mc_k,), t_val, device=device, dtype=torch.float32)
-                        v = policy.predict_velocity(
-                            z_mc, x_tau.expand(mc_k, -1, -1), tau_mc
-                        ).mean(0, keepdim=True)
-                    else:
-                        x_mc = (
-                            x_tau.unsqueeze(1)
-                            .expand(b, mc_k, self.config.chunk_size, self.config.action_dim)
-                            .reshape(b * mc_k, self.config.chunk_size, self.config.action_dim)
-                        )
-                        tau_mc = torch.full((b * mc_k,), t_val, device=device, dtype=torch.float32)
-                        v = (
-                            policy.predict_velocity(z_mc, x_mc, tau_mc)
-                            .reshape(b, mc_k, self.config.chunk_size, self.config.action_dim)
-                            .mean(dim=1)
-                        )
-                else:
-                    tau = torch.full((b,), t_val, device=device, dtype=torch.float32)
-                    v = policy.predict_velocity(z_fused, x_tau, tau)
+                tau = torch.full((b,), t_val, device=device, dtype=torch.float32)
+                v = policy.predict_velocity(z_fused, x_tau, tau)
                 x_tau = x_tau + dt * v
 
-            policy.eval()
             actions = policy.unnormalize_actions(x_tau)
             if clip_to_limits:
                 low = torch.as_tensor(JOINT_LIMITS_LOW, device=device, dtype=torch.float32)
@@ -256,7 +223,6 @@ class ConditionalFlowMatcher:
                 ode_steps=self.config.ode_steps,
                 clip_to_limits=True,
                 return_aux=False,
-                obs_dropout_mc_k=0,
             )
             assert isinstance(pred_actions, torch.Tensor)
             sq_err = (pred_actions - target_actions).pow(2)

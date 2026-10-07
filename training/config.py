@@ -55,10 +55,10 @@ class AlloyTrainConfig:
     gripper_weight: float = 2.5
     shift_pad: int = 4
     dropout: float = 0.0
-    keypoint_noise: float = 0.01
-    proprio_noise_std: float = 0.02
-    proprio_drop_prob: float = 0.10
-    wrist_cam_drop_prob: float = 0.05
+    keypoint_noise: float = 0.0
+    proprio_noise_std: float = 0.0
+    proprio_drop_prob: float = 0.0
+    wrist_cam_drop_prob: float = 0.0
     aux_pos_loss_weight: float = 0.5
     pretrain_loc_steps: int = 3000
     loc_data_path: str = "data/loc_layouts_3000.npz"
@@ -74,7 +74,6 @@ class AlloyTrainConfig:
 
     # Inference & memory settings
     ode_steps: int = 10
-    obs_dropout_mc_k: int = 0
     temporal_ensemble_decay: float = 0.05
     rolling_window_size: int = 8192
     seed: int = 42

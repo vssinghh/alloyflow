@@ -94,12 +94,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run strict benchmark evaluation (>=20 seeds/task) on both training and test splits.",
     )
     parser.add_argument(
-        "--obs-dropout-mc-k",
-        type=int,
-        default=0,
-        help="Number of test-time obs_dropout masks to average per ODE step (default: 0).",
-    )
-    parser.add_argument(
         "--seed-offset",
         type=int,
         default=0,
@@ -149,7 +143,6 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
     evaluator = SimPolicyEvaluator(
         checkpoint_path=args.checkpoint,
         device=args.device,
-        obs_dropout_mc_k=args.obs_dropout_mc_k,
     )
     results: list[EpisodeEvalResult] = []
     try:
@@ -161,7 +154,6 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                 test_base_seed=9000,
                 domain_rand=args.dr,
                 max_steps=args.max_steps,
-                obs_dropout_mc_k=args.obs_dropout_mc_k,
                 seed_offset=args.seed_offset,
                 num_workers=args.workers,
                 exec_horizon=args.exec_horizon,
@@ -177,7 +169,6 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                     demo_key=key,
                     h5_path=args.h5_path,
                     max_steps=args.max_steps,
-                    obs_dropout_mc_k=args.obs_dropout_mc_k,
                     seed_offset=args.seed_offset,
                     exec_horizon=args.exec_horizon,
                     use_temporal_ensemble=use_ensemble,
@@ -196,7 +187,6 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                         seed=seed,
                         domain_rand=args.dr,
                         max_steps=args.max_steps,
-                        obs_dropout_mc_k=args.obs_dropout_mc_k,
                         seed_offset=args.seed_offset,
                         exec_horizon=args.exec_horizon,
                         use_temporal_ensemble=use_ensemble,

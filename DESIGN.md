@@ -208,11 +208,11 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 ![Stage 2: Flow Matching Training](assets/stage2_training.png)
 * **How (`training/trainer.py`, `training/flow_matching.py`)**: Starts from the Stage 1 vision weights and trains the full policy (`batch_size = 128`, cosine learning rate `5e-4 -> 2.5e-5`, with resumable per-epoch `latest.pt` checkpointing).
 * **Training-Only Position Side Branch**: The 3 per-camera position heads remain active during Stage 2 as parallel side branches ($\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + 0.5 \cdot \mathcal{L}_{\text{pos}}$, mixing demo frames and replayed Stage 1 layouts) so the CNNs keep sub-centimeter object localization while the Flow ResMLP learns control. Their `12D` coordinate outputs never enter the policy trunk.
-* **Best Checkpoint Selection & Zero-Dropout Velocity Head (`dropout = 0.0`)**: At the end of each epoch, evaluates ODE action-chunk error (`val_ode_mse`) on `512` validation samples and saves `best_policy.pt`. With `900` full-DART demonstrations (`128,919` frames), domain randomization, and continuous flow-matching noise ($x_0 \sim \mathcal{N}(0, I)$), the `Flow ResMLP` head uses `dropout = 0.0` (`Exp 08b`). Removing dropout eliminates the `LayerNorm + SiLU` train-to-eval variance shift (`val_ode_mse: 0.00220 -> 0.00151`) so training and deterministic `.eval()` inference (`obs_dropout_mc_k = 0`) are `100%` identical at every epoch (`112 / 120 = 93.3%` benchmark pass).
+* **Best Checkpoint Selection & Zero-Dropout Velocity Head (`dropout = 0.0`)**: At the end of each epoch, evaluates ODE action-chunk error (`val_ode_mse`) on `512` validation samples and saves `best_policy.pt`. With `900` full-DART demonstrations (`128,919` frames), domain randomization, and continuous flow-matching noise ($x_0 \sim \mathcal{N}(0, I)$), the policy uses `dropout = 0.0` and zero internal feature/modality corruption (`keypoint_noise = 0.0`, `proprio_noise_std = 0.0`, `proprio_drop_prob = 0.0`, `wrist_cam_drop_prob = 0.0`). Removing dropout and synthetic feature corruption eliminates the `.train()` vs `.eval()` distribution shift (`val_ode_mse: 0.00220 -> 0.00151`) so training and deterministic `.eval()` inference are `100%` identical at every epoch (`112 / 120 = 93.3%` benchmark pass).
 
 #### Stage 3: Closed-Loop Inference on the Robot (`20 Hz`)
 ![Stage 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
-* **Zero Position-Head Overhead & Single-Pass Deterministic `.eval()` (`obs_dropout_mc_k = 0`)**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` once into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$) in deterministic `.eval()` mode (`2.86 ms/step` = `350 Hz` on CPU), and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
+* **Zero Position-Head Overhead & Single-Pass Deterministic `.eval()`**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` once into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$) in deterministic `.eval()` mode (`2.86 ms/step` = `350 Hz` on CPU), and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
 
 | Component | Stage 1: Vision Pretraining | Stage 2: Policy Training (`dropout = 0.0`) | Stage 3: `20 Hz` Inference |
 | :--- | :--- | :--- | :--- |
@@ -220,7 +220,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | **`Task Embedding (3 -> 32D)`** | Trained from scratch | Fine-tuned | Used (`32D` task vector) |
 | **`Proprio MLP (6 -> 64D)`** | Unused | Trained from scratch | Used (`64D` joint vector) |
 | **`3 Per-Camera Pos Heads`** | Trained (`12D` XY targets) | Co-supervised (`0.5 * L_pos`) | **Ignored** (zero overhead) |
-| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step, `dropout=0.0`) | Used (`5` Euler ODE steps, `k=0` `.eval()`) |
+| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step, `dropout=0.0`) | Used (`5` Euler ODE steps, `.eval()`) |
 
 ***
 
@@ -229,13 +229,13 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 1. **Task Embedding (`nn.Embedding(3, 32)`)**:
    - Maps `task_id in {0, 1, 2}` to a `32D` vector $\mathbf{z}_{\text{task}}$ shared across Task `FiLM` inside each camera CNN, the `192D` fused vector $\mathbf{z}_{\text{fused}}$, and the training-only position heads.
 2. **Proprioception MLP (`6D -> 64D -> 64D`)**:
-   - Z-score normalizes the current `6D` joint positions $\mathbf{q}_t$ (`proprio_history_lags = (0,)`) using dataset statistics stored in the checkpoint, and passes them through two `Linear + LayerNorm(64) + SiLU` layers to output $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$. During training, applies small Gaussian noise (`proprio_noise_std = 0.02`) and `10%` embedding dropout (`proprio_drop_prob = 0.10`).
+   - Z-score normalizes the current `6D` joint positions $\mathbf{q}_t$ (`proprio_history_lags = (0,)`) using dataset statistics stored in the checkpoint, and passes them through two `Linear + LayerNorm(64) + SiLU` layers to output $\mathbf{z}_{\text{prop}} \in \mathbb{R}^{64}$.
 3. **Tri-Camera Spatial Softmax CNN (`3 x SpatialSoftmaxConvNet`)**:
    - One independent CNN per camera (`third_person_cam`, `overhead_cam`, `wrist_cam`), with $\pm 4\text{ px}$ random image shift augmentation during training.
    - **4 Conv Blocks (`128x128 -> 16x16`)**: `Conv1 (k=5, s=2 -> 64x64)`, `Conv2 (k=3, s=2 -> 32x32)`, `Conv3 (k=3, s=2 -> 16x16)` with `GroupNorm + SiLU`, followed by `Conv4 (k=3, s=1 -> 16x16) + GroupNorm + Task FiLM` (without pre-softmax `SiLU` so negative background logits are suppressed).
    - **2D Spatial Softmax (`16x16` Grid, `32` Keypoints, Learnable `temp=0.1`)**: Extracts `32` expected `(x, y)` keypoint coordinates (`64D`) per camera and projects them via `Linear(64 -> 32) + LayerNorm(32) + SiLU` into camera tokens $\mathbf{z}_{\text{tp}}, \mathbf{z}_{\text{ov}}, \mathbf{z}_{\text{wr}} \in \mathbb{R}^{32}$.
 4. **Direct Multi-Camera Concatenation (`192D` Fused Vector)**:
-   - Concatenates the three `32D` camera tokens directly with $\mathbf{z}_{\text{prop}}$ (`64D`) and $\mathbf{z}_{\text{task}}$ (`32D`) without cross-camera attention mixing (applying `5%` training dropout on $\mathbf{z}_{\text{wr}}$):
+   - Concatenates the three `32D` camera tokens directly with $\mathbf{z}_{\text{prop}}$ (`64D`) and $\mathbf{z}_{\text{task}}$ (`32D`) without cross-camera attention mixing:
      $$\mathbf{z}_{\text{fused}} = [\mathbf{z}_{\text{tp}} (32\text{D}) \,;\, \mathbf{z}_{\text{ov}} (32\text{D}) \,;\, \mathbf{z}_{\text{wr}} (32\text{D}) \,;\, \mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{192}$$
 5. **Conditional Flow Matching Head (`4-Block ResMLP`, `K = 4` Stratified Sampling, `dropout = 0.0`)**:
    - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.0`) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
@@ -260,10 +260,10 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`1.06M` trainable params; `1.03M` active at inference). |
 | `pretrain_loc_steps` / `aux_pos_loss_weight` | `3000` / `0.5` | Stage 1 vision pretraining steps (`data/loc_layouts_3000.npz`) and Stage 2 position loss weight. |
 | `num_flow_samples` (`K`) / `gripper_weight` | `4` / `2.5` | Stratified flow samples per CNN pass and loss weight on gripper joint `5`. |
-| `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.0` | Image shift augmentation (`px`), training keypoint noise, and zero `ResMLP` dropout (`0.0`). |
-| `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.02` / `0.10` / `0.05` | Training-only sensor noise and modality dropout probabilities. |
+| `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.0` / `0.0` | Image shift augmentation (`px`) and zero internal feature/velocity dropout (`0.0`). |
+| `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.0` / `0.0` / `0.0` | Zero synthetic sensor noise and modality dropout (relying on `900` DART demos). |
 | `batch_size` / `epochs` / `rolling_window_size` | `128` / `40..60` / `8192` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `8,192`-sample memmap window. |
-| `ode_steps` / `obs_dropout_mc_k` / `temporal_ensemble_decay` | `5` / `0` / `0.05` | Closed-loop inference Euler steps, deterministic `.eval()` (`k=0`), and $w_i = \exp(-0.05 \cdot i)$ blending. |
+| `ode_steps` / `temporal_ensemble_decay` | `5` / `0.05` | Closed-loop inference Euler steps (`.eval()`) and $w_i = \exp(-0.05 \cdot i)$ blending. |
 
 ***
 
