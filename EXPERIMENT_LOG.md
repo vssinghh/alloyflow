@@ -23,7 +23,8 @@ Each experiment is evaluated on **`120` closed-loop episodes** (`60` training se
 | **Exp 05 (`exp05_wide_jaw`, rejected)** | Wider gripper opening during approach/descent (`0.65 -> 0.85`, `data/sim_demos_v3.h5`) | `96 / 120` (`80.0%`) | `74 / 120` (`61.7%`) | `21 / 60` (`35.0%`) | `21 / 60` (`35.0%`) | `42 / 120` (`35.0%`) | Single-hinge geometry shifts jaw center `14.9 mm` sideways during close, causing side-swiping misses |
 | **Exp 06 (`exp06_dart`)** | DART source recovery demos (`data/sim_demos_v2_dart.h5`): $\delta \sim \mathcal{U}(0, 2.5\text{ cm})$ hover offset with clean `v2` labels | `116 / 120` (`96.7%`) | `103 / 120` (`85.8%`) | `36 / 60` (`60.0%`) | `26 / 60` (`43.3%`) | `62 / 120` (`51.7%`) | Hand corrects on descent (`2.43 -> 0.83 cm` error), rim blocks drop (`51 -> 43`), and total pass reaches `51.7%` |
 | **Exp 07 (`exp07_dart_full`)** | Full source + target DART demos (`data/sim_demos_v2_dart_full.h5`): source DART down to `dz = 3.5 cm` + target carry/lower DART | `118 / 120` (`98.3%`) | `104 / 120` (`86.7%`) | `40 / 60` (`66.7%`) | `26 / 60` (`43.3%`) | `66 / 120` (`55.0%`) | Target release error drops (`1.11 -> 0.90 cm`), target placement failures drop `-35%` (`20 -> 13`), `Task 1` jumps `42.5% -> 62.5%`, and total pass reaches `55.0%` |
-| **Exp 08 (`exp08_dart_full_900`)** | **`3x` demo scale (`900` full-DART demos, `300/task`, `40` epochs) + test-time `obs_dropout` MC averaging (`obs_dropout_mc_k = 8`)** | **`120 / 120` (`100.0%`)** | **`117 / 120` (`97.5%`)** | **`57 / 60` (`95.0%`)** | **`50 / 60` (`83.3%`)** | **`107 / 120` (`89.2%`)** (`109 / 120 = 90.8%` at `k=4`) | **Eliminates `obs_dropout` train/eval shift (`34/120` at `k=0` $\to$ `107..109/120` at `k=4..16`), nearly doubles unseen test pass (`43.3% -> 83.3%..88.3%`), and lifts all 3 tasks to `85%..95%`** |
+| **Exp 08 (`exp08_dart_full_900`)** | `3x` demo scale (`900` full-DART demos, `300/task`, `40` epochs) + test-time `obs_dropout` MC averaging (`obs_dropout_mc_k = 8`) | `120 / 120` (`100.0%`) | `117 / 120` (`97.5%`) | `57 / 60` (`95.0%`) | `50 / 60` (`83.3%`) | `107 / 120` (`89.2%`) (`109 / 120 = 90.8%` at `k=4`) | Eliminates `obs_dropout` train/eval shift (`34/120` at `k=0` $\to$ `107..109/120` at `k=4..16`) and nearly doubles unseen test pass (`43.3% -> 83.3%..88.3%`) |
+| **Exp 08b (`exp08b_cooldown_k0`)** | **`5`-epoch `dropout = 0.0` Flow Velocity Head cooldown (`lr = 5e-5 -> 1e-6`, `k = 0` deterministic `.eval()`)** | **`120 / 120` (`100.0%`)** | **`118 / 120` (`98.3%`)** | **`58 / 60` (`96.7%`)** | **`54 / 60` (`90.0%`)** | **`112 / 120` (`93.3%`)** | **Calibrates all `9` velocity-head dropout layers to `p = 0.0`, cutting `BLOCKED` grasps in half (`45 -> 21`) and reaching `93.3%` at `k = 0` (`350 Hz` CPU)** |
 
 ***
 
@@ -411,8 +412,54 @@ In `Exp 06` and `Exp 07`, training pass rose from `60.0%` to `66.7%`, while unse
   - **Root-cause resolution of the `obs_dropout` train/eval shift**: Because `encode_observations` runs once per step and only the lightweight 4-block `ResMLP` runs on a batch of `k = 8` dropout-masked observation vectors, `obs_dropout_mc_k = 8` removes `96%` of the deterministic `shoulder_pan` bias (`-0.071 -> -0.003` normalized) while adding just `+1.15 ms/step` on CPU (`249.6 Hz` vs. `20 Hz` control rate).
   - **Every task exceeds `82%` and overall pass reaches `89.2%..90.8%` (`107..109 / 120`)**: Across `k = 4, 8, 16` and independent seed offsets, `Exp 08` achieves `120 / 120 (100.0%)` object reaches, `117 / 120 (97.5%)` centered grasps (`< 1.5 cm`), `117 / 120 (97.5%)` object lifts (`>= 2.0 cm`), `117 / 120 (97.5%)` target-zone arrivals (`< 6.0 cm`), and `107..109 / 120` strict task completions.
   - **Held-out test generalization nearly doubles (`43.3% -> 83.3%..88.3%`)**: Unseen test split pass jumped from `26 / 60 (43.3%)` in `Exp 07` to **`50 / 60 (83.3%)`** at `k = 8` (`53 / 60 = 88.3%` at `k = 4`), confirming that `300` full-DART demos per task provide dense workspace coverage across all three manipulation tasks.
-* **Decision**: **Accepted as new hero baseline (`checkpoints/exp08_dart_full_900/best_policy.pt` with `obs_dropout_mc_k = 8`, `107 / 120 = 89.2%` at `k=8` and `109 / 120 = 90.8%` at `k=4`)**.
+* **Decision**: **Accepted (`checkpoints/exp08_dart_full_900/best_policy.pt`, later upgraded to `Exp 08b` `k = 0` cooldown)**.
 
 ### 4. What to Try Next
-1. **Remove or replace `obs_dropout` during training so `k = 0` matches `k = 8`**: Retraining without `obs_dropout` on `obs_proj(z_fused)` (or folding the dropout expectation into the layer norm calibration) can achieve the same `~90%` pass rate in single-sample deterministic `.eval()` mode (`k = 0`).
-2. **Audit the remaining `11..13 / 120` failure episodes (`3` grasp/lift misses + `8..10` target placement bounces)**: Inspecting the `3` unlifted episodes and the `8..10` episodes that reach the target zone (`117 / 120`) but miss final placement criteria can push strict pass above `93%..95%`.
+1. **Run a 5-epoch `dropout = 0.0` cooldown on the Flow Velocity Head so `k = 0` works natively**: Calibrate all `9` dropout layers (`obs_dropout` + `8` internal `ResMLPBlock` dropouts) to `p = 0.0` so single-pass `.eval()` (`k = 0`) needs no test-time MC sampling.
+
+***
+
+## Experiment 08b: 5-Epoch Zero-Dropout Velocity-Head Cooldown (`exp08b_cooldown_k0`)
+
+* **Commit / Checkpoint**: `checkpoints/exp08b_cooldown_k0/best_policy.pt`
+
+### 1. Hypothesis
+While `obs_dropout_mc_k = 8` in `Exp 08` resolved the train/eval shift on `self.obs_dropout` (`1` layer), [`TaskConditionedVisionFlowPolicy`](./training/model.py) also contains `8` internal `nn.Dropout(0.05)` layers inside its four [`ResMLPBlock`](./training/model.py) modules (`2` per block). Switching those `8` internal dropout layers from `.train()` to `.eval()` at test time still left a smaller uncalibrated `LayerNorm + SiLU` variance shift (`val_ode_mse = 0.00192`, `BLOCKED = 45 / 120`). We hypothesized that freezing the observation encoders (`extract_obs_features`: `camera_encoders`, `proprio_mlp`, `task_embedding`) in `.eval()` mode and running a **5-epoch Dropout Cooldown** (`dropout = 0.0` across all `9` velocity-head dropout layers, `lr = 5e-5 -> 1e-6`) on the same `900`-demo Flow Matching objective (`L_CFM`) would calibrate the entire `ResMLP` stack to deterministic `.eval()` mode (`obs_dropout_mc_k = 0`), eliminating test-time MC sampling while reducing `BLOCKED` grasps even further.
+
+### 2. Changes
+* **Stage A Observation Encoder Frozen in `.eval()` Mode**: Kept `task_embedding` (`96` params), `proprio_mlp` (`4,864` params), and `camera_encoders` (`242,883` params) frozen in `.eval()` mode (`keypoint_noise = 0.0`, `wrist_cam_drop_prob = 0.0`), preserving the exact `192D` `z_fused` features from `Exp 08`.
+* **Stage B Flow Velocity Network Cooldown (`778,592` Params, `dropout = 0.0`)**:
+  - Set `self.obs_dropout.p = 0.0` (`1` layer) and all `8` `ResMLPBlock` dropout layers to `p = 0.0`.
+  - Fine-tuned `obs_proj`, `act_proj`, `time_encoder`, `res_blocks`, and `out_head` (`73.7%` of model parameters) for `5` epochs (`batch_size = 256`, cosine `lr = 5e-5 -> 1e-6`, `12.5 seconds` total on cached `z_fused`) on `data/sim_demos_v2_dart_full_900.h5` (`810` train demos, `90` val demos) using `L_CFM`.
+  - Also compared against a `5`-epoch `distill_mc` variant that distilled the `k = 8` MC-dropout teacher velocity field.
+* **Code & CLI Defaults ([`training/config.py`](./training/config.py), [`evaluation/evaluator.py`](./evaluation/evaluator.py), [`evaluation/__main__.py`](./evaluation/__main__.py))**: Saved `checkpoints/exp08b_cooldown_k0/best_policy.pt` and set default `obs_dropout_mc_k = 0`.
+
+### 3. Results
+
+| Metric (`120` Episodes: `60` Train + `60` Test) | `Exp 08` Raw (`k = 0` Eval) | `Exp 08` MC (`k = 8` Trick) | `Exp 08b` Distill-MC (**`k = 0` Eval**) | **`Exp 08b` `L_CFM` Cooldown (`k = 0` Eval, Default)** |
+| :--- | :---: | :---: | :---: | :---: |
+| **Test-Time Dropout Masks (`obs_dropout_mc_k`)** | `0` | `8` | **`0` (Pure `.eval()`)** | **`0` (Pure `.eval()`)** |
+| **CPU Inference Latency (`ode_steps = 5`)** | `2.86 ms/step` (`350 Hz`) | `4.01 ms/step` (`250 Hz`) | **`2.86 ms/step` (`350 Hz`)** | **`2.86 ms/step` (`350 Hz`)** |
+| **Normalized `shoulder_pan` Bias vs. `MC-16`** | `-0.0494` | `-0.0030` | `+0.0002` | **`+0.0029` (`-94.1%` bias)** |
+| **Validation ODE Error (`val_ode_mse`)** | `0.00220` | `0.00192` | `0.00189` | **`0.00151`** |
+| **Reached Object (`< 2.0 cm`)** | `119 / 120 (99.2%)` | `120 / 120 (100.0%)` | `120 / 120 (100.0%)` | **`120 / 120 (100.0%)`** |
+| **Centered at Grasp Close (`< 1.5 cm`)** | `102 / 120 (85.0%)` | `117 / 120 (97.5%)` | `117 / 120 (97.5%)` | **`118 / 120 (98.3%)`** (`60/60` train, `58/60` test) |
+| **`BLOCKED` Grasps (`Total`: `Fixed / Moving / Nbr`)** | `72 / 120` (`9 / 63 / 0`) | `45 / 120` (`3 / 42 / 0`) | `45 / 120` (`3 / 42 / 0`) | **`21 / 120` (`0 / 21 / 0`, `-53.3%` vs `k=8`)** |
+| **Lifted Object (`>= 2.0 cm`)** | `78 / 120 (65.0%)` | `117 / 120 (97.5%)` | `116 / 120 (96.7%)` | **`118 / 120 (98.3%)`** |
+| **Reached Target Zone (`< 6.0 cm`)** | `66 / 120 (55.0%)` | `117 / 120 (97.5%)` | `114 / 120 (95.0%)` | **`118 / 120 (98.3%)`** |
+| **Task 0 (`pick_pen_holder_to_bowl`, `40` eps)** | `11 / 40 (27.5%)` | `36 / 40 (90.0%)` | `35 / 40 (87.5%)` | **`38 / 40 (95.0%)`** (`20/20` train, `18/20` test) |
+| **Task 1 (`pick_cup_to_bowl`, `40` eps)** | `12 / 40 (30.0%)` | `37 / 40 (92.5%)` | `38 / 40 (95.0%)` | **`38 / 40 (95.0%)`** (`18/20` train, **`20/20` test**) |
+| **Task 2 (`stack_cup_on_cube`, `40` eps)** | `11 / 40 (27.5%)` | `34 / 40 (85.0%)` | `35 / 40 (87.5%)` | **`36 / 40 (90.0%)`** (`20/20` train, `16/20` test) |
+| **Task Success: Train Split (`60` eps)** | `18 / 60 (30.0%)` | `57 / 60 (95.0%)` | `57 / 60 (95.0%)` | **`58 / 60 (96.7%)`** |
+| **Task Success: Test Split (`60` eps)** | `16 / 60 (26.7%)` | `50 / 60 (83.3%)` | `51 / 60 (85.0%)` | **`54 / 60 (90.0%)`** |
+| **Task Success: Combined (`120` eps)** | `34 / 120 (28.3%)` | `107 / 120 (89.2%)` | `108 / 120 (90.0%)` | **`112 / 120 (93.3%)`** |
+
+* **What worked**:
+  - **Calibrating all `9` velocity-head dropout layers cut `BLOCKED` grasps in half (`45 -> 21`)**: Removing the residual `LayerNorm + SiLU` variance shift across the 4 `ResMLPBlock` layers eliminated fixed-jaw-pad blocks (`0 / 120`) and dropped total `BLOCKED` grasps from `45 / 120` (`k = 8`) to **`21 / 120`**.
+  - **Every task reaches $\ge 90.0\%$ and unseen test pass hits `90.0%` (`54 / 60`)**: In standard single-pass `.eval()` mode (`k = 0`, `2.86 ms/step` on CPU), `Exp 08b` scores `38 / 40 (95.0%)` on `Task 0`, `38 / 40 (95.0%)` on `Task 1` (`20 / 20 = 100.0%` on unseen test scenes), `36 / 40 (90.0%)` on `Task 2`, and **`112 / 120 (93.3%)`** combined.
+* **Decision**: **Accepted as new hero baseline (`checkpoints/exp08b_cooldown_k0/best_policy.pt`, `obs_dropout_mc_k = 0`, `112 / 120 = 93.3%`)**.
+
+### 4. What to Try Next
+1. **Real-Robot (`SO-ARM101`) Co-Training & Evaluation (`Mode 3: finetune` and `Mode 4: cotrain`)**: With the simulation baseline at `93.3%` (`90.0%` unseen test) and running at `350 Hz` on CPU in standard `.eval()` mode, evaluate zero-shot transfer and `50/50` co-training on physical `SO-ARM101` teleop demonstrations.
+2. **Audit the remaining `8 / 120` failure episodes (`2` grasp/lift misses + `6` target placement misses)**: Inspecting the final `8` failed rollouts (`2` on `Task 0`, `2` on `Task 1`, `4` on `Task 2`) can guide any further trajectory or gripper refinements.
+

@@ -165,10 +165,10 @@ class SimPolicyEvaluator:
 
     def __init__(
         self,
-        checkpoint_path: str | Path = "checkpoints/exp08_dart_full_900/best_policy.pt",
+        checkpoint_path: str | Path = "checkpoints/exp08b_cooldown_k0/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
-        obs_dropout_mc_k: int = 8,
+        obs_dropout_mc_k: int = 0,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.policy, self.config, self.ckpt_meta = load_policy_checkpoint(

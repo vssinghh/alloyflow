@@ -208,19 +208,19 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 ![Stage 2: Flow Matching Training](assets/stage2_training.png)
 * **How (`training/trainer.py`, `training/flow_matching.py`)**: Starts from the Stage 1 vision weights and trains the full policy (`batch_size = 128`, cosine learning rate `5e-4 -> 2.5e-5`, with resumable per-epoch `latest.pt` checkpointing).
 * **Training-Only Position Side Branch**: The 3 per-camera position heads remain active during Stage 2 as parallel side branches ($\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + 0.5 \cdot \mathcal{L}_{\text{pos}}$, mixing demo frames and replayed Stage 1 layouts) so the CNNs keep sub-centimeter object localization while the Flow ResMLP learns control. Their `12D` coordinate outputs never enter the policy trunk.
-* **Best Checkpoint Selection**: At the end of each epoch, evaluates 10-step ODE action-chunk error (`val_ode_mse`) on `512` validation samples and saves the lowest-error weights to `best_policy.pt`.
+* **Best Checkpoint Selection & 5-Epoch Dropout Cooldown (`Exp 08b`)**: At the end of each epoch, evaluates ODE action-chunk error (`val_ode_mse`) on `512` validation samples and saves `best_policy.pt`. After the main `40`-epoch training run (`dropout = 0.05`), a `5`-epoch **Dropout Cooldown** (`cooldown_epochs = 5`, `cooldown_lr = 5e-5 -> 1e-6`) freezes the observation encoders in `.eval()` mode and trains the Flow Velocity Head (`predict_velocity`) with all `9` dropout layers set to `p = 0.0` (`checkpoints/exp08b_cooldown_k0/best_policy.pt`). This eliminates the `LayerNorm + SiLU` train-to-eval variance shift (`val_ode_mse: 0.00220 -> 0.00151`) so the policy runs natively in deterministic `.eval()` mode (`obs_dropout_mc_k = 0`) at `112 / 120 (93.3%)` benchmark pass.
 
 #### Stage 3: Closed-Loop Inference on the Robot (`20 Hz`)
 ![Stage 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
-* **Zero Position-Head Overhead & Test-Time Dropout Averaging (`obs_dropout_mc_k = 8`)**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` once into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$) while averaging predicted velocities across `k = 8` independent `obs_dropout` masks per ODE step (`4.01 ms/step` on CPU) to match the training feature distribution, and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
+* **Zero Position-Head Overhead & Single-Pass Deterministic `.eval()` (`obs_dropout_mc_k = 0`)**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` once into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$) in deterministic `.eval()` mode (`2.86 ms/step` = `350 Hz` on CPU; optional `--obs-dropout-mc-k 8` is also supported for uncalibrated checkpoints), and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
 
-| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training | Stage 3: `20 Hz` Inference |
+| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training + Cooldown | Stage 3: `20 Hz` Inference |
 | :--- | :--- | :--- | :--- |
-| **`3x Spatial Softmax CNN`** | Trained from scratch | Fine-tuned | Used (`96D` camera tokens, run once/step) |
-| **`Task Embedding (3 -> 32D)`** | Trained from scratch | Fine-tuned | Used (`32D` task vector) |
-| **`Proprio MLP (6 -> 64D)`** | Unused | Trained from scratch | Used (`64D` joint vector) |
+| **`3x Spatial Softmax CNN`** | Trained from scratch | Fine-tuned (frozen in 5-ep cooldown) | Used (`96D` camera tokens, run once/step) |
+| **`Task Embedding (3 -> 32D)`** | Trained from scratch | Fine-tuned (frozen in 5-ep cooldown) | Used (`32D` task vector) |
+| **`Proprio MLP (6 -> 64D)`** | Unused | Trained (frozen in 5-ep cooldown) | Used (`64D` joint vector) |
 | **`3 Per-Camera Pos Heads`** | Trained (`12D` XY targets) | Co-supervised (`0.5 * L_pos`) | **Ignored** (zero overhead) |
-| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step) | Used (`5` Euler ODE steps, `obs_dropout_mc_k=8`) |
+| **`4-Block Flow ResMLP`** | Unused | Trained (`40` ep `p=0.05` + `5` ep `p=0.0`) | Used (`5` Euler ODE steps, `k=0` `.eval()`) |
 
 ***
 
@@ -238,7 +238,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
    - Concatenates the three `32D` camera tokens directly with $\mathbf{z}_{\text{prop}}$ (`64D`) and $\mathbf{z}_{\text{task}}$ (`32D`) without cross-camera attention mixing (applying `5%` training dropout on $\mathbf{z}_{\text{wr}}$):
      $$\mathbf{z}_{\text{fused}} = [\mathbf{z}_{\text{tp}} (32\text{D}) \,;\, \mathbf{z}_{\text{ov}} (32\text{D}) \,;\, \mathbf{z}_{\text{wr}} (32\text{D}) \,;\, \mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{192}$$
 5. **Conditional Flow Matching Head (`4-Block ResMLP`, `K = 4` Stratified Sampling)**:
-   - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`) followed by `obs_dropout` (`nn.Dropout(0.05)`), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.05`) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
+   - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`) followed by `obs_dropout` (`nn.Dropout(0.05)` during main training, `0.0` during cooldown), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.05` during main training, `0.0` during cooldown) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
    - Evaluates `K = 4` stratified flow timesteps per observation during training so the 3 CNNs run only once per batch.
 
 ***
@@ -247,7 +247,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 | Mode Flag | Training Dataset(s) | Batch Sampling | Learning Rate | Normalization Stats (`norm_stats`) |
 | :--- | :--- | :--- | :---: | :--- |
-| **`sim_only`** | `data/sim_demos_v2_dart_full_900.h5` (`900` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2_dart_full_900.h5` & saved in checkpoint |
+| **`sim_only`** | `data/sim_demos_v2_dart_full_900.h5` (`900` Sim demos) | `128` Sim samples/batch | `5e-4` (`5e-5` cooldown) | Computed from `sim_demos_v2_dart_full_900.h5` & saved in checkpoint |
 | **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
 | **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
 | **`cotrain`** | `data/sim_demos_v2_dart_full_900.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
@@ -260,10 +260,10 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | `hidden_dim` / `num_res_blocks` | `256` / `4` | `ResMLP` width and depth (`1.06M` trainable params; `1.03M` active at inference). |
 | `pretrain_loc_steps` / `aux_pos_loss_weight` | `3000` / `0.5` | Stage 1 vision pretraining steps (`data/loc_layouts_3000.npz`) and Stage 2 position loss weight. |
 | `num_flow_samples` (`K`) / `gripper_weight` | `4` / `2.5` | Stratified flow samples per CNN pass and loss weight on gripper joint `5`. |
-| `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.05` | Image shift augmentation (`px`), training keypoint noise, and `ResMLP` dropout. |
+| `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.05 -> 0.0` | Image shift augmentation (`px`), training keypoint noise, and `ResMLP` dropout (`0.0` in 5-epoch cooldown). |
 | `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.02` / `0.10` / `0.05` | Training-only sensor noise and modality dropout probabilities. |
-| `batch_size` / `epochs` / `rolling_window_size` | `128` / `40..60` / `8192` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `8,192`-sample memmap window. |
-| `ode_steps` / `obs_dropout_mc_k` / `temporal_ensemble_decay` | `5` / `8` / `0.05` | Closed-loop inference Euler steps, `k=8` `obs_dropout` MC averaging, and $w_i = \exp(-0.05 \cdot i)$ blending. |
+| `batch_size` / `epochs` / `cooldown_epochs` | `128` / `40..60` / `5` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `5`-epoch `dropout = 0.0` velocity-head cooldown. |
+| `ode_steps` / `obs_dropout_mc_k` / `temporal_ensemble_decay` | `5` / `0` / `0.05` | Closed-loop inference Euler steps, deterministic `.eval()` (`k=0`), and $w_i = \exp(-0.05 \cdot i)$ blending. |
 
 ***
 

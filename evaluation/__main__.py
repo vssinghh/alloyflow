@@ -16,7 +16,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/exp08_dart_full_900/best_policy.pt",
+        default="checkpoints/exp08b_cooldown_k0/best_policy.pt",
         help="Path to trained policy checkpoint (.pt).",
     )
     parser.add_argument(
@@ -96,8 +96,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--obs-dropout-mc-k",
         type=int,
-        default=8,
-        help="Number of test-time obs_dropout masks to average per ODE step (default: 8).",
+        default=0,
+        help="Number of test-time obs_dropout masks to average per ODE step (default: 0).",
     )
     parser.add_argument(
         "--seed-offset",

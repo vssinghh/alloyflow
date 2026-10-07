@@ -27,7 +27,7 @@ class AlloyTrainConfig:
     real_data_path: str = "data/real_demos.h5"
     pretrained_checkpoint: str | None = None
     resume_checkpoint: str | None = None
-    default_finetune_checkpoint: str = "checkpoints/exp08_dart_full_900/best_policy.pt"
+    default_finetune_checkpoint: str = "checkpoints/exp08b_cooldown_k0/best_policy.pt"
     save_dir: str = ""
     real_ratio: float = 0.5
 
@@ -69,12 +69,14 @@ class AlloyTrainConfig:
     epochs: int = 60
     lr: float = 5e-4
     finetune_lr: float = 1e-4
+    cooldown_epochs: int = 5
+    cooldown_lr: float = 5e-5
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
 
     # Inference & memory settings
     ode_steps: int = 10
-    obs_dropout_mc_k: int = 8
+    obs_dropout_mc_k: int = 0
     temporal_ensemble_decay: float = 0.05
     rolling_window_size: int = 8192
     seed: int = 42
