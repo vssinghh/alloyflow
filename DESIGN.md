@@ -23,7 +23,7 @@ By changing only the task ID (`0`, `1`, or `2`), the same model performs 3 diffe
 ### Objective 2: Compare 4 Training Modes
 Using the exact same model architecture and test episodes, compare how the robot performs across **4 training modes**:
 1. **Mode 1: `Sim-Only` (`100%` Simulation Data)**
-   - **Training**: Trained only on MuJoCo simulation demos (`100` demos per task, `300` total).
+   - **Training**: Trained only on MuJoCo simulation demos (`300` demos per task, `900` total).
    - **Goal**: Measure baseline performance in simulation, and test how well a simulation-only model transfers directly to the real robot without any real training data.
 2. **Mode 2: `Real-Only` (`100%` Real Robot Data)**
    - **Training**: Trained only on a small set of real robot demos (`20` demos per task, `60` total).
@@ -32,7 +32,7 @@ Using the exact same model architecture and test episodes, compare how the robot
    - **Training**: Start from the `Mode 1 (Sim-Only)` model weights, then continue training on the `20` real demos per task (`60` total).
    - **Goal**: Measure if pretraining in simulation helps real-world performance, and check if finetuning causes the model to forget how to solve the simulation tasks.
 4. **Mode 4: `Sim + Real Co-Training` (`50%` Sim + `50%` Real in Every Batch)**
-   - **Training**: Train from scratch where every batch of `128` samples pulls `64` samples from the `300` simulation demos and `64` samples from the `60` real robot demos.
+   - **Training**: Train from scratch where every batch of `128` samples pulls `64` samples from the `900` simulation demos and `64` samples from the `60` real robot demos.
    - **Goal**: Test if mixing simulation and real data in every batch gives the best real-world generalization while keeping high performance in simulation.
 
 ***
@@ -102,22 +102,22 @@ alloyflow/                        # Repository Root
 ### CLI Commands
 1. **Collect Demos (`Sim` or `Real`)**:
    ```bash
-   uv run python -m collection --domain sim --task all --episodes 100
+   uv run python -m collection --domain sim --task all --episodes 300 --trajectory-version v2_dart_full --h5-path data/sim_demos_v2_dart_full_900.h5
    uv run python -m collection --domain real --task 0 --episodes 20
    ```
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
    # Train on remote Colab GPU (--colab) or local Mac GPU (--local)
-   ./scripts/train.sh exp07_dart_full --colab --mode sim_only
-   ./scripts/train.sh exp07_dart_full --local --mode sim_only
+   ./scripts/train.sh exp08_dart_full_900 --colab --mode sim_only --epochs 40
+   ./scripts/train.sh exp08_dart_full_900 --local --mode sim_only --epochs 40
 
    # Co-train on 50% Sim + 50% Real
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
    ```bash
-   uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --benchmark --episodes 20
-   uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+   uv run python -m evaluation --checkpoint checkpoints/exp08_dart_full_900/best_policy.pt --benchmark --episodes 20
+   uv run python -m evaluation --checkpoint checkpoints/exp08_dart_full_900/best_policy.pt --demos demo_0000,demo_0301,demo_0600
    ```
 4. **Run Tests**:
    ```bash
@@ -134,7 +134,7 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 - **Camera Images**: Three `128x128` RGB images (`uint8`) per step.
 
 ### 4.1 Simulation Data Collection (`--domain sim`)
-`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) across 6 mechanisms (`trajectory_version = "v2_dart_full"` in `data/sim_demos_v2_dart_full.h5`):
+`collection/sim_expert.py` solves each task in MuJoCo using 6-DoF Inverse Kinematics (IK) across 6 mechanisms (`trajectory_version = "v2_dart_full"` in `data/sim_demos_v2_dart_full_900.h5`):
 1. **Hover & Descend**: Move above the source object and lower the open gripper (`0.65 -> 0.62`) down to grasp height.
 2. **Full Source + Target DART Recovery Perturbations (`perturbation = "dart_full"`)**: Each episode draws independent horizontal offsets $\delta_{\text{src}}, \delta_{\text{tgt}} \sim \mathcal{U}(0, 2.5\text{ cm})$. During approach and source descent, the executed arm path ramps from `0` at home to full $\delta_{\text{src}}$ at `hover_src`, decays to $\le 0.2\text{ cm}$ at pinch height $dz = 4.5\text{ cm}$, and reaches `0` by $dz = 3.5\text{ cm}$ above the object center. During carry (after the lifted source clears `3.0 cm` above the table) and target lower, the executed path ramps to full $\delta_{\text{tgt}}$ at `hover_tgt` and decays linearly to `0` by `1.5 cm` above the final placement height (`place_z`), while always recording the unperturbed clean `v2` IK joint targets as `actions[t]`.
 3. **Close in Place**: Pause at the bottom for `4` nominal steps, close the gripper (`0.60 -> 0.05`) while stationary over `8` nominal steps, and hold for `4` nominal steps before lifting.
@@ -142,9 +142,10 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 5. **Open in Place & Retract**: Pause at the target for `3` nominal steps, open the gripper (`0.05 -> 0.65`) while stationary, and retract upward with open jaws.
 6. **Speed Variation ($\pm 20\%$)**: Scale segment speeds by $\mathcal{U}(0.8, 1.2)$ on each episode so the policy learns to trigger actions from visual cues rather than memorizing a fixed step timer.
 
-* **Dataset Scale & Domain Randomization (`100` demos per task, `300` total)**:
-  - **Clean Simulation (`50` demos per task, `150` total)**: Randomized object `(X, Y)` positions across the table with fixed studio lighting and camera mounts.
-  - **Domain-Randomized Simulation (`50` demos per task, `150` total)**: Varies lighting direction, object and tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass (`0.7x to 1.5x`).
+* **Dataset Scale & Domain Randomization (`300` demos per task, `900` total, `128,919` frames)**:
+  - **Clean Simulation (`150` demos per task, `450` total)**: Randomized object `(X, Y)` positions across the table with fixed studio lighting and camera mounts.
+  - **Domain-Randomized Simulation (`150` demos per task, `450` total)**: Varies lighting direction, object and tabletop colors, $\pm 1\text{ cm}$ camera mount shifts, and object mass (`0.7x to 1.5x`).
+  - **Disk-Backed Memory-Mapped Streaming**: `HDF5DemoDataset` unpacks large RGB datasets (`> 4 GB`) into a disk-backed `np.memmap` cache (`19.01 GB` for `900` demos) and streams shuffled `8,192`-sample rolling windows (`1.21 GB` RAM per window) so training fits within standard `12.7 GiB` Colab T4 RAM.
 
 * **4 Automated Quality Checks (Verified Before Saving Any Demo)**:
   Every simulated episode must pass 4 checks before it is written to `.h5` (failed seeds are skipped automatically):
@@ -159,7 +160,7 @@ Both simulation and real-world collection save data in the exact same `.h5` file
 2. **Follower Arm (Motor Torque On)**: The follower arm copies the leader arm's `6` joint positions in real time while the script records the follower's actual joint positions, the commanded joint targets, and the 3 USB camera frames.
 3. **Keyboard Controls**: Press `SPACE` to start and stop recording an episode, or `r` (`BACKSPACE`) to discard a failed attempt. We collect **`20` demos per task (`60` total)** into `data/real_demos.h5`.
 
-### 4.3 HDF5 File Format (`data/sim_demos_v2_dart_full.h5` & `data/real_demos.h5`)
+### 4.3 HDF5 File Format (`data/sim_demos_v2_dart_full_900.h5` & `data/real_demos.h5`)
 ```text
 <domain>_demos.h5
 ├── attrs:
@@ -200,26 +201,26 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 #### Stage 1: Vision Pretraining (`3,000` Labeled Tabletop Scenes)
 ![Stage 1: Vision Pretraining](assets/stage1_pretrain.png)
-* **Why**: `300` demonstrations are too few distinct tabletop layouts for action loss alone to teach the CNNs accurate 2D object coordinates.
+* **Why**: Action loss alone is slow to teach the CNNs accurate 2D object coordinates across cluttered multi-object scenes.
 * **How (`training/pretrain_vision.py`)**: Renders `3,000` static 3-camera scenes (`data/loc_layouts_3000.npz`, `50%` clean + `50%` domain-randomized) and trains the 3 camera CNNs, Task Embedding, and 3 per-camera `12D` object-position heads (`aux_cam_pos_heads`) for `3,000` steps to predict the `(X, Y)` tabletop coordinates of `[source, target, pen_holder, cup, bowl, rubiks_cube]`.
 
-#### Stage 2: Flow Matching Training + Co-Supervised Position Loss (`60` Epochs)
+#### Stage 2: Flow Matching Training + Co-Supervised Position Loss (`40` to `60` Epochs)
 ![Stage 2: Flow Matching Training](assets/stage2_training.png)
-* **How (`training/trainer.py`, `training/flow_matching.py`)**: Starts from the Stage 1 vision weights and trains the full policy for `60` epochs (`batch_size = 128`, cosine learning rate `5e-4 -> 2.5e-5`).
+* **How (`training/trainer.py`, `training/flow_matching.py`)**: Starts from the Stage 1 vision weights and trains the full policy (`batch_size = 128`, cosine learning rate `5e-4 -> 2.5e-5`, with resumable per-epoch `latest.pt` checkpointing).
 * **Training-Only Position Side Branch**: The 3 per-camera position heads remain active during Stage 2 as parallel side branches ($\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CFM}} + 0.5 \cdot \mathcal{L}_{\text{pos}}$, mixing demo frames and replayed Stage 1 layouts) so the CNNs keep sub-centimeter object localization while the Flow ResMLP learns control. Their `12D` coordinate outputs never enter the policy trunk.
-* **Best Checkpoint Selection**: At the end of each epoch, evaluates 10-step ODE action-chunk error (`val_ode_mse`) on `512` validation samples in `eval()` mode and saves the lowest-error weights to `best_policy.pt`.
+* **Best Checkpoint Selection**: At the end of each epoch, evaluates 10-step ODE action-chunk error (`val_ode_mse`) on `512` validation samples and saves the lowest-error weights to `best_policy.pt`.
 
 #### Stage 3: Closed-Loop Inference on the Robot (`20 Hz`)
 ![Stage 3: Closed-Loop Inference at 20 Hz](assets/stage3_inference.png)
-* **Zero Position-Head Overhead**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$), and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
+* **Zero Position-Head Overhead & Test-Time Dropout Averaging (`obs_dropout_mc_k = 8`)**: At inference, the 3 position heads are ignored. Every `50 ms` (`exec_horizon = 1`), the policy encodes the 3 camera images, `6D` joint state, and `task_id` once into `z_fused (192D)`, integrates the `Flow ResMLP` over `5` Euler ODE steps ($\Delta\tau = 0.2$) while averaging predicted velocities across `k = 8` independent `obs_dropout` masks per ODE step (`4.01 ms/step` on CPU) to match the training feature distribution, and blends overlapping `16 x 6` action chunks via Temporal Ensembling ($w_i = \exp(-0.05 \cdot i)$).
 
-| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training (`60` Ep) | Stage 3: `20 Hz` Inference |
+| Component | Stage 1: Vision Pretraining | Stage 2: Policy Training | Stage 3: `20 Hz` Inference |
 | :--- | :--- | :--- | :--- |
-| **`3x Spatial Softmax CNN`** | Trained from scratch | Fine-tuned | Used (`96D` camera tokens) |
+| **`3x Spatial Softmax CNN`** | Trained from scratch | Fine-tuned | Used (`96D` camera tokens, run once/step) |
 | **`Task Embedding (3 -> 32D)`** | Trained from scratch | Fine-tuned | Used (`32D` task vector) |
 | **`Proprio MLP (6 -> 64D)`** | Unused | Trained from scratch | Used (`64D` joint vector) |
 | **`3 Per-Camera Pos Heads`** | Trained (`12D` XY targets) | Co-supervised (`0.5 * L_pos`) | **Ignored** (zero overhead) |
-| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step) | Used (`5` Euler ODE steps) |
+| **`4-Block Flow ResMLP`** | Unused | Trained (`K=4` flow samples/step) | Used (`5` Euler ODE steps, `obs_dropout_mc_k=8`) |
 
 ***
 
@@ -237,7 +238,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
    - Concatenates the three `32D` camera tokens directly with $\mathbf{z}_{\text{prop}}$ (`64D`) and $\mathbf{z}_{\text{task}}$ (`32D`) without cross-camera attention mixing (applying `5%` training dropout on $\mathbf{z}_{\text{wr}}$):
      $$\mathbf{z}_{\text{fused}} = [\mathbf{z}_{\text{tp}} (32\text{D}) \,;\, \mathbf{z}_{\text{ov}} (32\text{D}) \,;\, \mathbf{z}_{\text{wr}} (32\text{D}) \,;\, \mathbf{z}_{\text{prop}} (64\text{D}) \,;\, \mathbf{z}_{\text{task}} (32\text{D})] \in \mathbb{R}^{192}$$
 5. **Conditional Flow Matching Head (`4-Block ResMLP`, `K = 4` Stratified Sampling)**:
-   - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.05`) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
+   - Projects $\mathbf{z}_{\text{fused}}$ through a 2-layer MLP (`obs_proj`) followed by `obs_dropout` (`nn.Dropout(0.05)`), sums with projected noisy action chunk $x_\tau = (1 - \tau) x_0 + \tau x_1$ and `SinusoidalTimeEmbedding` ($\tau \in [0, 1]$), and runs through `4` pre-norm `ResMLPBlock` layers (`hidden_dim = 256`, `dropout = 0.05`) to predict target velocity $u_\tau = x_1 - x_0$ (`gripper_weight = 2.5` on joint `5`).
    - Evaluates `K = 4` stratified flow timesteps per observation during training so the 3 CNNs run only once per batch.
 
 ***
@@ -246,10 +247,10 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 | Mode Flag | Training Dataset(s) | Batch Sampling | Learning Rate | Normalization Stats (`norm_stats`) |
 | :--- | :--- | :--- | :---: | :--- |
-| **`sim_only`** | `data/sim_demos_v2_dart_full.h5` (`300` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2_dart_full.h5` & saved in checkpoint |
+| **`sim_only`** | `data/sim_demos_v2_dart_full_900.h5` (`900` Sim demos) | `128` Sim samples/batch | `5e-4` | Computed from `sim_demos_v2_dart_full_900.h5` & saved in checkpoint |
 | **`real_only`** | `data/real_demos.h5` (`60` Real demos) | `128` Real samples/batch | `5e-4` | Computed from `real_demos.h5` & saved in checkpoint |
 | **`finetune`** | Pretrained `sim_only` $\to$ `data/real_demos.h5` | `128` Real samples/batch | `1e-4` | **Locked from `sim_only` checkpoint** (no stat drift) |
-| **`cotrain`** | `data/sim_demos_v2_dart_full.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
+| **`cotrain`** | `data/sim_demos_v2_dart_full_900.h5` + `data/real_demos.h5` | **`64` Sim + `64` Real** (`real_ratio=0.5`) | `5e-4` | Computed across combined training set & saved |
 
 | Hyperparameter | Default Value | Purpose |
 | :--- | :---: | :--- |
@@ -261,8 +262,8 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | `num_flow_samples` (`K`) / `gripper_weight` | `4` / `2.5` | Stratified flow samples per CNN pass and loss weight on gripper joint `5`. |
 | `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.05` | Image shift augmentation (`px`), training keypoint noise, and `ResMLP` dropout. |
 | `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.02` / `0.10` / `0.05` | Training-only sensor noise and modality dropout probabilities. |
-| `batch_size` / `epochs` / `val_samples_per_epoch` | `128` / `60` / `512` | `240` flow passes per sample (`60 * K`), AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check. |
-| `ode_steps` / `exec_horizon` / `temporal_ensemble_decay` | `5` / `1` / `0.05` | Closed-loop inference Euler steps, single-step re-query, and $w_i = \exp(-0.05 \cdot i)$ blending. |
+| `batch_size` / `epochs` / `rolling_window_size` | `128` / `40..60` / `8192` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `8,192`-sample memmap window. |
+| `ode_steps` / `obs_dropout_mc_k` / `temporal_ensemble_decay` | `5` / `8` / `0.05` | Closed-loop inference Euler steps, `k=8` `obs_dropout` MC averaging, and $w_i = \exp(-0.05 \cdot i)$ blending. |
 
 ***
 
@@ -272,8 +273,8 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 
 ### 6.1 Benchmark Split (`120` Episodes Total)
 Running `python -m evaluation --checkpoint <path> --benchmark --episodes 20` evaluates **`120` episodes**:
-1. **Training Split (`60` episodes, `20` per task)**: Replays the exact scene seeds from `data/sim_demos_v2_dart_full.h5` (`seeds 1000..1549`, `2000..2549`, `3000..3549`) to test in-distribution accuracy.
-2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019`, `10000..10019`, `11000..11019`) with novel object placements.
+1. **Training Split (`60` episodes, `20` per task)**: Replays the first `20` `sim_clean` scene seeds per task from `data/sim_demos_v2_dart_full_900.h5` (`seeds 1000..1019`, `11000..11021`, `21000..21019`) to test in-distribution accuracy.
+2. **Held-Out Test Split (`60` episodes, `20` per task)**: Evaluates unseen test seeds (`seeds 9000..9019`, `19000..19019`, `29000..29019`) with novel object placements.
 
 ### 6.2 Core Funnel Metrics & Diagnostic GIFs
 Every benchmark run reports 4 stage-by-stage metrics across all `120` episodes:

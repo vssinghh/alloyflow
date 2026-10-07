@@ -256,6 +256,7 @@ class ConditionalFlowMatcher:
                 ode_steps=self.config.ode_steps,
                 clip_to_limits=True,
                 return_aux=False,
+                obs_dropout_mc_k=0,
             )
             assert isinstance(pred_actions, torch.Tensor)
             sq_err = (pred_actions - target_actions).pow(2)

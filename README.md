@@ -19,9 +19,9 @@ All 3 tasks run on the same tabletop scene with 4 everyday objects (`pen_holder`
 
 | Mode | CLI Flag | Training Data | What We Measure |
 | :--- | :--- | :--- | :--- |
-| **Mode 1: `Sim-Only`** | `--mode sim_only` | `300` MuJoCo demos (`100`/task) | Sim baseline and zero-shot Sim-to-Real transfer gap |
+| **Mode 1: `Sim-Only`** | `--mode sim_only` | `900` MuJoCo demos (`300`/task) | Sim baseline and zero-shot Sim-to-Real transfer gap |
 | **Mode 2: `Real-Only`** | `--mode real_only` | `60` real SO-ARM101 demos (`20`/task) | Real-world learning from small data and failure modes on new positions |
-| **Mode 3: `Finetune`** | `--mode finetune` | Pretrain on `300` Sim, finetune on `60` Real | Real-world adaptation vs. forgetting simulation skills |
+| **Mode 3: `Finetune`** | `--mode finetune` | Pretrain on `900` Sim, finetune on `60` Real | Real-world adaptation vs. forgetting simulation skills |
 | **Mode 4: `Co-Train`** | `--mode cotrain` | `50%` Sim + `50%` Real in every batch | Best combined real-world generalization and simulation retention |
 
 ***
@@ -33,17 +33,17 @@ All 3 tasks run on the same tabletop scene with 4 everyday objects (`pen_holder`
 uv sync
 
 # 1. Collect demonstrations (Sim or Real)
-uv run python -m collection --domain sim --task all --episodes 100
+uv run python -m collection --domain sim --task all --episodes 300 --trajectory-version v2_dart_full --h5-path data/sim_demos_v2_dart_full_900.h5
 uv run python -m collection --domain real --task 0 --episodes 20
 
 # 2. Train policy (Colab GPU or local Mac MPS; modes: sim_only | real_only | finetune | cotrain)
-./scripts/train.sh exp07_dart_full --colab --mode sim_only
-./scripts/train.sh exp07_dart_full --local --mode sim_only
+./scripts/train.sh exp08_dart_full_900 --colab --mode sim_only --epochs 40
+./scripts/train.sh exp08_dart_full_900 --local --mode sim_only --epochs 40
 uv run python -m training --mode cotrain --real-ratio 0.5
 
 # 3. Evaluate policy (120-episode benchmark or per-demo diagnostic GIFs)
-uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --benchmark --episodes 20
-uv run python -m evaluation --checkpoint checkpoints/exp07_dart_full/best_policy.pt --demos demo_0000,demo_0101,demo_0200
+uv run python -m evaluation --checkpoint checkpoints/exp08_dart_full_900/best_policy.pt --benchmark --episodes 20
+uv run python -m evaluation --checkpoint checkpoints/exp08_dart_full_900/best_policy.pt --demos demo_0000,demo_0301,demo_0600
 
 # 4. Run unit tests
 uv run pytest

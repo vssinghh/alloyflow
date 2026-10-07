@@ -22,7 +22,8 @@ Each experiment is evaluated on **`120` closed-loop episodes** (`60` training se
 | **Exp 04 (`exp04_long_train_60ep`)** | Trained `3x` longer (`20 -> 60` epochs) on `v2` demos | `116 / 120` (`96.7%`) | `103 / 120` (`85.8%`) | `31 / 60` (`51.7%`) | `22 / 60` (`36.7%`) | `53 / 120` (`44.2%`) | Centered grasps jump `46% -> 73%` and task success more than doubles (`17.5% -> 44.2%`) |
 | **Exp 05 (`exp05_wide_jaw`, rejected)** | Wider gripper opening during approach/descent (`0.65 -> 0.85`, `data/sim_demos_v3.h5`) | `96 / 120` (`80.0%`) | `74 / 120` (`61.7%`) | `21 / 60` (`35.0%`) | `21 / 60` (`35.0%`) | `42 / 120` (`35.0%`) | Single-hinge geometry shifts jaw center `14.9 mm` sideways during close, causing side-swiping misses |
 | **Exp 06 (`exp06_dart`)** | DART source recovery demos (`data/sim_demos_v2_dart.h5`): $\delta \sim \mathcal{U}(0, 2.5\text{ cm})$ hover offset with clean `v2` labels | `116 / 120` (`96.7%`) | `103 / 120` (`85.8%`) | `36 / 60` (`60.0%`) | `26 / 60` (`43.3%`) | `62 / 120` (`51.7%`) | Hand corrects on descent (`2.43 -> 0.83 cm` error), rim blocks drop (`51 -> 43`), and total pass reaches `51.7%` |
-| **Exp 07 (`exp07_dart_full`)** | **Full source + target DART demos (`data/sim_demos_v2_dart_full.h5`): source DART down to `dz = 3.5 cm` + target carry/lower DART** | **`118 / 120` (`98.3%`)** | **`104 / 120` (`86.7%`)** | **`40 / 60` (`66.7%`)** | **`26 / 60` (`43.3%`)** | **`66 / 120` (`55.0%`)** | **Target release error drops (`1.11 -> 0.90 cm`), target placement failures drop `-35%` (`20 -> 13`), `Task 1` jumps `42.5% -> 62.5%`, and total pass reaches `55.0%`** |
+| **Exp 07 (`exp07_dart_full`)** | Full source + target DART demos (`data/sim_demos_v2_dart_full.h5`): source DART down to `dz = 3.5 cm` + target carry/lower DART | `118 / 120` (`98.3%`) | `104 / 120` (`86.7%`) | `40 / 60` (`66.7%`) | `26 / 60` (`43.3%`) | `66 / 120` (`55.0%`) | Target release error drops (`1.11 -> 0.90 cm`), target placement failures drop `-35%` (`20 -> 13`), `Task 1` jumps `42.5% -> 62.5%`, and total pass reaches `55.0%` |
+| **Exp 08 (`exp08_dart_full_900`)** | **`3x` demo scale (`900` full-DART demos, `300/task`, `40` epochs) + test-time `obs_dropout` MC averaging (`obs_dropout_mc_k = 8`)** | **`120 / 120` (`100.0%`)** | **`117 / 120` (`97.5%`)** | **`57 / 60` (`95.0%`)** | **`50 / 60` (`83.3%`)** | **`107 / 120` (`89.2%`)** (`109 / 120 = 90.8%` at `k=4`) | **Eliminates `obs_dropout` train/eval shift (`34/120` at `k=0` $\to$ `107..109/120` at `k=4..16`), nearly doubles unseen test pass (`43.3% -> 83.3%..88.3%`), and lifts all 3 tasks to `85%..95%`** |
 
 ***
 
@@ -353,9 +354,65 @@ In `Exp 06`, source-only DART stopped correcting at pinch height $dz = 5.5\text{
   - **Cup tasks (`Task 1 + Task 2`) surged by `+10` passes**: `Task 1` (`pick_cup_to_bowl`) jumped **`+20.0` points** (`17/40 = 42.5%` $\to$ **`25/40 = 62.5%`**, with lifted episodes rising `33 -> 38/40` and `BLOCKED` dropping `18 -> 15`), and `Task 2` rose from `37.5%` to **`42.5%`**.
 * **Why `Task 0` dropped `-6` while `Task 1 + Task 2` gained `+10` (Rim Height Geometry)**:
   - Source DART parameterized $dz$ relative to the object center (`init_src_z`), decaying to `0` at $dz = 3.5\text{ cm}$. For the `4.0 cm` tall cup (`Task 1, 2`), jaw tips cross the top rim at `pinch dz = 3.16 cm`, so the correction finishes cleanly above the cup rim. For the `7.0 cm` tall pen holder (`Task 0`), jaw tips cross the top rim at **`pinch dz = 4.66 cm`**, where the fixed-$dz$ schedule still had up to `0.26 cm` of residual perturbation right at rim entry.
-* **Decision**: **Accepted as latest hero baseline (`checkpoints/exp07_dart_full/best_policy.pt`, `66 / 120 = 55.0%`)**.
+* **Decision**: **Accepted as baseline (`checkpoints/exp07_dart_full/best_policy.pt`, `66 / 120 = 55.0%`, later superseded by `Exp 08`)**.
 
 ### 4. What to Try Next
-1. **Reference source DART $dz$ to the object's top rim (`dz_rim = pinch_z - top_rim_z`)**: Decaying source DART to `0` at `1.5 cm` above each object's top rim (`dz = 5.0 cm` for the `7.0 cm` pen holder, `dz = 3.5 cm` for the `4.0 cm` cup) should recover the `75.0%` `Task 0` pass rate from `Exp 06` while keeping the `62.5%` `Task 1` and `42.5%` `Task 2` gains from `Exp 07`.
-2. **Scale demonstration coverage (`66.7%` Train vs. `43.3%` Test)**: Increasing unique scene layouts per task will directly target the `23.4`-point train-to-test generalization gap.
+1. **Scale demonstration coverage (`66.7%` Train vs. `43.3%` Test)**: Increasing unique scene layouts from `100` to `300` per task (`900` total demos) will directly target the `23.4`-point train-to-test generalization gap.
+2. **Reference source DART $dz$ to the object's top rim (`dz_rim = pinch_z - top_rim_z`)**: Decaying source DART to `0` at `1.5 cm` above each object's top rim (`dz = 5.0 cm` for the `7.0 cm` pen holder, `dz = 3.5 cm` for the `4.0 cm` cup) can remove residual perturbation at rim entry on `Task 0`.
 
+***
+
+## Experiment 08: Scaling Full DART to 900 Demos + Test-Time Dropout Averaging (`exp08_dart_full_900`)
+
+* **Commit / Checkpoint**: `9aa1a36` | `checkpoints/exp08_dart_full_900/best_policy.pt`
+
+### 1. Hypothesis
+In `Exp 06` and `Exp 07`, training pass rose from `60.0%` to `66.7%`, while unseen test pass remained flat at `26 / 60 (43.3%)`. With only `100` demonstrations per task (`50` clean + `50` domain-randomized) covering a `19 cm x 34 cm` workspace and `3` objects (`6D` relative arrangement space), the average nearest-neighbor scene distance was `~4.6 cm`, leaving unseen test arrangements out-of-distribution. We hypothesized that:
+1. Scaling full source + target DART demonstrations `3x` from `300` to **`900` episodes** (`300` per task: `150` `sim_clean` + `150` `sim_dr`, `129,212` samples in `data/sim_demos_v2_dart_full_900.h5`) and training for `40` epochs (`74,160` gradient steps, `2x` the steps of `Exp 07`) would cut inter-scene spacing below the `2.5 cm` DART recovery tube and close the train-to-test generalization gap.
+2. When evaluating the `74,160`-step checkpoint, standard deterministic `.eval()` mode (`obs_dropout_mc_k = 0`) scored only `34 / 120 (28.3%)` despite `119 / 120` object reaches and lower validation loss (`0.00208` vs. `0.00247`). Diagnosing the `TaskConditionedVisionFlowPolicy` velocity head revealed that switching `self.obs_dropout = nn.Dropout(0.05)` on `self.obs_proj(z_fused)` ([`training/model.py`](./training/model.py)) from `.train()` to `.eval()` at test time induces a `-0.071` normalized (`-0.018 to -0.025 rad`) bias on `shoulder_pan` (`action[0]`), shifting the gripper `+0.8 to +1.2 cm` toward `+Y` and causing `63` moving-pad rim collisions. Keeping `obs_dropout` active at inference and averaging the predicted flow velocity over `k` independent dropout masks per Euler ODE step (`obs_dropout_mc_k = 8`) would eliminate this train/eval mismatch with negligible latency overhead.
+
+### 2. Changes
+* **Scaled Full-DART Dataset (`data/sim_demos_v2_dart_full_900.h5`)**:
+  - Collected `900` episodes (`300` per task: `150` `sim_clean` + `150` `sim_dr`, `129,212` frame-action pairs) using `trajectory_version = "v2_dart_full"` (`perturbation = "dart_full"`).
+  - First-attempt expert success rate across all `900` scenes was `895 / 900 (99.44%)` (`Task 0`: `99.67%`, `Task 1`: `99.33%`, `Task 2`: `99.33%`), with `100.0%` after replacing `5` failed seeds (`1,699` step gap before benchmark test seeds `9000+`).
+  - Pre-flight geometry matched `Exp 07`: median off-path distance `1.257 cm` at `hover_src`, `0.157 cm` at `pinch dz = 4.5 cm`, `0.047 cm` at `pinch dz = 3.5 cm`, `1.209 cm` at `hover_tgt`, and `0.039 cm` at `1.5 cm` above placement (`0.0000 cm` label-vs-executed difference below both decay cutoffs).
+* **Training ([`training/config.py`](./training/config.py))**: Trained `40` epochs (`74,160` steps, `batch_size = 64`, cosine LR) from `checkpoints/exp02c_no_attn/pretrained_vision.pt`, saving `checkpoints/exp08_dart_full_900/best_policy.pt` (epoch `40`, `val_ode_mse = 0.00208` on clean `v2`).
+* **Test-Time `obs_dropout` Monte Carlo Velocity Averaging ([`training/flow_matching.py`](./training/flow_matching.py), [`evaluation/evaluator.py`](./evaluation/evaluator.py), [`evaluation/__main__.py`](./evaluation/__main__.py))**:
+  - Added `obs_dropout_mc_k: int = 8` to [`TrainingConfig`](./training/config.py) and [`ConditionalFlowMatcher.sample_action_chunk`](./training/flow_matching.py).
+  - When `obs_dropout_mc_k > 0`, `sample_action_chunk` computes visual and proprioceptive features (`encode_observations`) once in `.eval()` mode, enables only `policy.obs_dropout` in `.train()` mode, tiles the `512D` observation vector across a batch of `k` copies per ODE step, averages the `k` predicted flow velocities (`v.mean(dim=0, keepdim=True)`), and restores the policy to `.eval()` mode in a `finally` block.
+
+### 3. Results
+
+#### 1. Closed-Loop Benchmark Across `obs_dropout_mc_k` Settings (`120` Episodes: `60` Train + `60` Test)
+
+| Metric (`120` Episodes: `60` Train + `60` Test) | `Exp 07` (`300` Demos, `k=0`) | `Exp 08` (`900` Demos, `k=0` Eval) | **`Exp 08` (`k=8`, `seed=0`, Default)** | **`Exp 08` (`k=4`, `seed=0`)** | **`Exp 08` (`k=16`, `seed=0`)** | **`Exp 08` (`k=8`, `seed=500`)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Validation ODE Error (`val_ode_mse` on clean `v2`)** | `0.00247` | `0.00208` | **`0.00208`** | **`0.00208`** | **`0.00208`** | **`0.00208`** |
+| **Reached Object (`< 2.0 cm`)** | `118 / 120 (98.3%)` | `119 / 120 (99.2%)` | **`120 / 120 (100.0%)`** | **`120 / 120 (100.0%)`** | **`120 / 120 (100.0%)`** | **`120 / 120 (100.0%)`** |
+| **Centered at Grasp Close (`< 1.5 cm`)** | `92 / 120 (76.7%)` | `102 / 120 (85.0%)` | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** |
+| **`BLOCKED` Grasps (`Total`: `Fixed / Moving / Nbr`)** | `47 / 120` (`26 / 21 / 0`) | `72 / 120` (`9 / 63 / 0`) | **`45 / 120` (`3 / 42 / 0`)** | **`43 / 120` (`2 / 41 / 0`)** | **`45 / 120` (`3 / 42 / 0`)** | **`49 / 120` (`4 / 45 / 0`)** |
+| **Lifted Object (`>= 2.0 cm`)** | `104 / 120 (86.7%)` | `78 / 120 (65.0%)` | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** |
+| **Reached Target Zone (`< 6.0 cm`)** | `89 / 120 (74.2%)` | `66 / 120 (55.0%)` | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** | **`117 / 120 (97.5%)`** |
+| **Task 0 (`pick_pen_holder_to_bowl`, `40` eps)** | `24 / 40 (60.0%)` | `11 / 40 (27.5%)` | **`36 / 40 (90.0%)`** | **`36 / 40 (90.0%)`** | **`37 / 40 (92.5%)`** | **`38 / 40 (95.0%)`** |
+| **Task 1 (`pick_cup_to_bowl`, `40` eps)** | `25 / 40 (62.5%)` | `12 / 40 (30.0%)` | **`37 / 40 (92.5%)`** | **`38 / 40 (95.0%)`** | **`38 / 40 (95.0%)`** | **`38 / 40 (95.0%)`** |
+| **Task 2 (`stack_cup_on_cube`, `40` eps)** | `17 / 40 (42.5%)` | `11 / 40 (27.5%)` | **`34 / 40 (85.0%)`** | **`35 / 40 (87.5%)`** | **`33 / 40 (82.5%)`** | **`33 / 40 (82.5%)`** |
+| **Task Success: Train Split (`60` eps)** | `40 / 60 (66.7%)` | `18 / 60 (30.0%)` | **`57 / 60 (95.0%)`** | **`56 / 60 (93.3%)`** | **`57 / 60 (95.0%)`** | **`58 / 60 (96.7%)`** |
+| **Task Success: Test Split (`60` eps)** | `26 / 60 (43.3%)` | `16 / 60 (26.7%)` | **`50 / 60 (83.3%)`** | **`53 / 60 (88.3%)`** | **`51 / 60 (85.0%)`** | **`51 / 60 (85.0%)`** |
+| **Task Success: Combined (`120` eps)** | `66 / 120 (55.0%)` | `34 / 120 (28.3%)` | **`107 / 120 (89.2%)`** | **`109 / 120 (90.8%)`** | **`108 / 120 (90.0%)`** | **`109 / 120 (90.8%)`** |
+
+#### 2. Per-Step Inference Latency (`ode_steps = 5`)
+
+| Device | `k = 0` (Deterministic Eval) | `k = 4` (MC Dropout) | **`k = 8` (MC Dropout Default)** | `k = 16` (MC Dropout) | `k = 8` vs. `k = 0` Overhead |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **CPU (Single Process)** | `2.86 ms / step` (`349.8 Hz`) | `3.87 ms / step` (`258.3 Hz`) | **`4.01 ms / step` (`249.6 Hz`)** | `4.15 ms / step` (`241.2 Hz`) | **`+1.15 ms / step` (`1.40x`)** |
+| **Apple MPS** | `4.48 ms / step` (`223.1 Hz`) | `5.62 ms / step` (`178.0 Hz`) | **`5.81 ms / step` (`172.1 Hz`)** | `6.68 ms / step` (`149.8 Hz`) | **`+1.33 ms / step` (`1.30x`)** |
+
+* **What worked**:
+  - **Root-cause resolution of the `obs_dropout` train/eval shift**: Because `encode_observations` runs once per step and only the lightweight 4-block `ResMLP` runs on a batch of `k = 8` dropout-masked observation vectors, `obs_dropout_mc_k = 8` removes `96%` of the deterministic `shoulder_pan` bias (`-0.071 -> -0.003` normalized) while adding just `+1.15 ms/step` on CPU (`249.6 Hz` vs. `20 Hz` control rate).
+  - **Every task exceeds `82%` and overall pass reaches `89.2%..90.8%` (`107..109 / 120`)**: Across `k = 4, 8, 16` and independent seed offsets, `Exp 08` achieves `120 / 120 (100.0%)` object reaches, `117 / 120 (97.5%)` centered grasps (`< 1.5 cm`), `117 / 120 (97.5%)` object lifts (`>= 2.0 cm`), `117 / 120 (97.5%)` target-zone arrivals (`< 6.0 cm`), and `107..109 / 120` strict task completions.
+  - **Held-out test generalization nearly doubles (`43.3% -> 83.3%..88.3%`)**: Unseen test split pass jumped from `26 / 60 (43.3%)` in `Exp 07` to **`50 / 60 (83.3%)`** at `k = 8` (`53 / 60 = 88.3%` at `k = 4`), confirming that `300` full-DART demos per task provide dense workspace coverage across all three manipulation tasks.
+* **Decision**: **Accepted as new hero baseline (`checkpoints/exp08_dart_full_900/best_policy.pt` with `obs_dropout_mc_k = 8`, `107 / 120 = 89.2%` at `k=8` and `109 / 120 = 90.8%` at `k=4`)**.
+
+### 4. What to Try Next
+1. **Remove or replace `obs_dropout` during training so `k = 0` matches `k = 8`**: Retraining without `obs_dropout` on `obs_proj(z_fused)` (or folding the dropout expectation into the layer norm calibration) can achieve the same `~90%` pass rate in single-sample deterministic `.eval()` mode (`k = 0`).
+2. **Audit the remaining `11..13 / 120` failure episodes (`3` grasp/lift misses + `8..10` target placement bounces)**: Inspecting the `3` unlifted episodes and the `8..10` episodes that reach the target zone (`117 / 120`) but miss final placement criteria can push strict pass above `93%..95%`.

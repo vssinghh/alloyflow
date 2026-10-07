@@ -247,6 +247,7 @@ def test_flow_matcher_and_temporal_ensembler() -> None:
     assert torch.all(sampled_actions <= high + 1e-5)
     assert set(aux["keypoints"].keys()) == set(CAMERA_NAMES)
 
+    policy.eval()
     mc_actions = matcher.sample_action_chunk(
         policy,
         {k: v[:1] for k, v in batch["obs"].items()},

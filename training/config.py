@@ -23,11 +23,11 @@ class AlloyTrainConfig:
 
     # Training mode & dataset paths
     train_mode: str = "sim_only"
-    sim_data_path: str = "data/sim_demos_v2_dart_full.h5"
+    sim_data_path: str = "data/sim_demos_v2_dart_full_900.h5"
     real_data_path: str = "data/real_demos.h5"
     pretrained_checkpoint: str | None = None
     resume_checkpoint: str | None = None
-    default_finetune_checkpoint: str = "checkpoints/exp07_dart_full/best_policy.pt"
+    default_finetune_checkpoint: str = "checkpoints/exp08_dart_full_900/best_policy.pt"
     save_dir: str = ""
     real_ratio: float = 0.5
 
@@ -74,7 +74,7 @@ class AlloyTrainConfig:
 
     # Inference & memory settings
     ode_steps: int = 10
-    obs_dropout_mc_k: int = 0
+    obs_dropout_mc_k: int = 8
     temporal_ensemble_decay: float = 0.05
     rolling_window_size: int = 8192
     seed: int = 42

@@ -165,10 +165,10 @@ class SimPolicyEvaluator:
 
     def __init__(
         self,
-        checkpoint_path: str | Path = "checkpoints/exp04_long_train_60ep/best_policy.pt",
+        checkpoint_path: str | Path = "checkpoints/exp08_dart_full_900/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
-        obs_dropout_mc_k: int = 0,
+        obs_dropout_mc_k: int = 8,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.policy, self.config, self.ckpt_meta = load_policy_checkpoint(
@@ -492,7 +492,7 @@ class SimPolicyEvaluator:
     def run_demo_case(
         self,
         demo_key: str = "demo_0000",
-        h5_path: str | Path = "data/sim_demos_v2.h5",
+        h5_path: str | Path = "data/sim_demos_v2_dart_full_900.h5",
         *,
         max_steps: int = 280,
         ode_steps: int | None = None,
@@ -543,7 +543,7 @@ class SimPolicyEvaluator:
         self,
         *,
         episodes_per_task: int = 20,
-        train_h5_path: str | Path = "data/sim_demos_v2.h5",
+        train_h5_path: str | Path = "data/sim_demos_v2_dart_full_900.h5",
         test_base_seed: int = 9000,
         domain_rand: bool = False,
         max_steps: int = 280,
