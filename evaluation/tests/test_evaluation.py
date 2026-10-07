@@ -106,6 +106,10 @@ def test_evaluator_saves_gif_and_strip(tmp_path: Path) -> None:
     assert res.gif_path is not None and Path(res.gif_path).exists()
     assert res.strip_path is not None and Path(res.strip_path).exists()
 
-    parsed = parse_args(["--demos", "demo_0000,demo_0200", "--max-steps", "40"])
+    parsed = parse_args(
+        ["--demos", "demo_0000,demo_0200", "--max-steps", "40", "--obs-dropout-mc-k", "8", "--seed-offset", "500"]
+    )
     assert parsed.demos == "demo_0000,demo_0200"
     assert parsed.max_steps == 40
+    assert parsed.obs_dropout_mc_k == 8
+    assert parsed.seed_offset == 500

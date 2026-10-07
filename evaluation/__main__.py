@@ -94,6 +94,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run strict benchmark evaluation (>=20 seeds/task) on both training and test splits.",
     )
     parser.add_argument(
+        "--obs-dropout-mc-k",
+        type=int,
+        default=0,
+        help="Number of test-time obs_dropout masks to average per ODE step (default: 0 = eval mode).",
+    )
+    parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help="Offset added to per-step torch.manual_seed during evaluation (default: 0).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes for --benchmark evaluation (default: 1).",
+    )
+    parser.add_argument(
+        "--report-out",
+        type=str,
+        default=None,
+        help="Optional output path for benchmark JSON report.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="auto",
@@ -125,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
     evaluator = SimPolicyEvaluator(
         checkpoint_path=args.checkpoint,
         device=args.device,
+        obs_dropout_mc_k=args.obs_dropout_mc_k,
     )
     results: list[EpisodeEvalResult] = []
     try:
@@ -136,8 +161,12 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                 test_base_seed=9000,
                 domain_rand=args.dr,
                 max_steps=args.max_steps,
+                obs_dropout_mc_k=args.obs_dropout_mc_k,
+                seed_offset=args.seed_offset,
+                num_workers=args.workers,
                 exec_horizon=args.exec_horizon,
                 use_temporal_ensemble=use_ensemble,
+                save_report_path=args.report_out,
                 verbose=True,
             )
             return results
@@ -148,6 +177,8 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                     demo_key=key,
                     h5_path=args.h5_path,
                     max_steps=args.max_steps,
+                    obs_dropout_mc_k=args.obs_dropout_mc_k,
+                    seed_offset=args.seed_offset,
                     exec_horizon=args.exec_horizon,
                     use_temporal_ensemble=use_ensemble,
                     save_gif=save_gif,
@@ -165,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> list[EpisodeEvalResult]:
                         seed=seed,
                         domain_rand=args.dr,
                         max_steps=args.max_steps,
+                        obs_dropout_mc_k=args.obs_dropout_mc_k,
+                        seed_offset=args.seed_offset,
                         exec_horizon=args.exec_horizon,
                         use_temporal_ensemble=use_ensemble,
                         save_gif=save_gif,

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
+import multiprocessing as mp
 from pathlib import Path
 from typing import Any
 
 import h5py
+import mujoco
 import numpy as np
 import torch
 
@@ -44,11 +47,85 @@ class EpisodeEvalResult:
     grasp_close_step: int | None = None
     grasp_close_xy_cm: float | None = None
     grasp_close_dz_cm: float | None = None
+    grasp_class: str | None = None
+    grasp_blocked: bool = False
+    blocked_pad: str | None = None
     gif_path: str | None = None
     strip_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def classify_grasp_steps(steps_75: list[dict[str, Any]]) -> tuple[str, str]:
+    """Classify approach/descent into BLOCKED, EARLY_CLOSE, or OTHER and detect first contact pad."""
+    if not steps_75:
+        return "OTHER", "neighbor"
+    tc = next((s["step"] for s in steps_75 if s["grip_cmd"] < 0.48), min(48, len(steps_75) - 1))
+    sc = steps_75[tc]
+    close_dz = float(sc["pinch_src_z_cm"])
+
+    w5 = steps_75[max(0, tc - 5) : tc + 1]
+    zgap_tc = float(sc.get("z_gap_cmd_cm", 0.0))
+    max_zgap_w5 = float(max(s.get("z_gap_cmd_cm", 0.0) for s in w5))
+    dz_vel_3 = float(
+        (steps_75[tc]["pinch_src_z_cm"] - steps_75[max(0, tc - 3)]["pinch_src_z_cm"]) / 3.0
+    )
+    disp_pre = float(max(s["src_disp_xy_cm"] for s in steps_75[: tc + 1]))
+    z_comp_mm = float(
+        max(
+            0.0,
+            (steps_75[0]["src_z_cm"] - min(s["src_z_cm"] for s in steps_75[: tc + 1])) * 10.0,
+        )
+    )
+
+    is_stalled_or_collapsed = (dz_vel_3 >= -0.10) or (z_comp_mm >= 10.0)
+    is_high_or_shoved = (close_dz >= 1.15) or (disp_pre >= 1.40 and max_zgap_w5 >= 1.00)
+    has_large_zgap = (max_zgap_w5 >= 0.80) or (zgap_tc >= 0.65)
+
+    if is_high_or_shoved and has_large_zgap and is_stalled_or_collapsed:
+        grasp_cls = "BLOCKED"
+    elif close_dz >= 1.15 and not has_large_zgap and dz_vel_3 < -0.10:
+        grasp_cls = "EARLY_CLOSE"
+    else:
+        grasp_cls = "OTHER"
+
+    first_pad = "neighbor"
+    for s in steps_75[: tc + 1]:
+        cons = s.get("gripper_src_contacts", [])
+        if cons:
+            has_f = any("fixed_jaw_pad" in c for c in cons)
+            has_m = any("moving_jaw_pad" in c for c in cons)
+            if has_f and has_m:
+                first_pad = "both"
+            elif has_f:
+                first_pad = "fixed_jaw_pad"
+            elif has_m:
+                first_pad = "moving_jaw_pad"
+            else:
+                first_pad = "other_geom"
+            break
+    return grasp_cls, first_pad
+
+
+def _benchmark_worker(args: tuple[str, str, int, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Worker process for parallel benchmark evaluation."""
+    ckpt_path, device_str, obs_dropout_mc_k, jobs = args
+    if device_str == "cpu":
+        torch.set_num_threads(1)
+    evaluator = SimPolicyEvaluator(
+        checkpoint_path=ckpt_path,
+        device=device_str,
+        obs_dropout_mc_k=obs_dropout_mc_k,
+    )
+    out: list[dict[str, Any]] = []
+    try:
+        for job in jobs:
+            res = evaluator.run_episode(**job)
+            out.append(res.to_dict())
+    finally:
+        evaluator.close()
+    return out
 
 
 def diagnose_rollout_status(
@@ -91,6 +168,7 @@ class SimPolicyEvaluator:
         checkpoint_path: str | Path = "checkpoints/exp04_long_train_60ep/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
+        obs_dropout_mc_k: int = 0,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.policy, self.config, self.ckpt_meta = load_policy_checkpoint(
@@ -98,8 +176,14 @@ class SimPolicyEvaluator:
         )
         self.policy.eval()
         self.device = next(self.policy.parameters()).device
+        self.obs_dropout_mc_k = int(obs_dropout_mc_k)
         self.matcher = ConditionalFlowMatcher(self.config)
         self.env = SimEnv(domain_rand=False, include_rgb=True)
+        self._fk_data = mujoco.MjData(self.env.model)
+        self._geom_id_to_name = {
+            i: mujoco.mj_id2name(self.env.model, mujoco.mjtObj.mjOBJ_GEOM, i) or f"geom_{i}"
+            for i in range(self.env.model.ngeom)
+        }
         self.visualizer = RolloutVisualizer(self.env, cam_size=cam_render_size)
 
     def close(self) -> None:
@@ -136,6 +220,8 @@ class SimPolicyEvaluator:
         gt_actions: np.ndarray | None = None,
         max_steps: int = 280,
         ode_steps: int | None = None,
+        obs_dropout_mc_k: int | None = None,
+        seed_offset: int = 0,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
         save_gif: bool = False,
@@ -150,6 +236,9 @@ class SimPolicyEvaluator:
         dom_str = "sim_dr" if domain_rand else "sim_clean"
         label = episode_label or f"task{task_id}_seed{seed}"
         steps_ode = int(ode_steps if ode_steps is not None else 5)
+        mc_k = int(
+            obs_dropout_mc_k if obs_dropout_mc_k is not None else self.obs_dropout_mc_k
+        )
 
         self.env.domain_rand = bool(domain_rand)
         obs = self.env.reset(task_id=int(task_id), seed=int(seed))
@@ -169,7 +258,8 @@ class SimPolicyEvaluator:
 
         src_bid = self.env._obj_body_ids[spec.source_object]
         tgt_bid = self.env._obj_body_ids[spec.target_object]
-        init_src_z_cm = float(self.env.data.body(src_bid).xpos[2]) * 100.0
+        init_src_pos = self.env.data.body(src_bid).xpos.copy()
+        init_src_z_cm = float(init_src_pos[2]) * 100.0
 
         min_pinch_src_xy_cm = float("inf")
         max_src_z_cm = init_src_z_cm
@@ -177,6 +267,7 @@ class SimPolicyEvaluator:
         grasp_close_xy_cm: float | None = None
         grasp_close_dz_cm: float | None = None
         latencies_ms: list[float] = []
+        steps_75: list[dict[str, Any]] = []
 
         cached_chunk: np.ndarray | None = None
         cached_kp: dict[str, np.ndarray] = {}
@@ -195,7 +286,7 @@ class SimPolicyEvaluator:
                     prop_history, len(prop_history) - 1, lags=lags
                 )
                 obs_t = self._prepare_obs_tensors(obs, proprio_history=prop_hist_np)
-                torch.manual_seed(int(seed) * 1000 + step)
+                torch.manual_seed(int(seed) * 1000 + step + int(seed_offset))
                 t0 = time.perf_counter()
                 if save_gif:
                     chunk_t, aux = self.matcher.sample_action_chunk(
@@ -205,6 +296,7 @@ class SimPolicyEvaluator:
                         ode_steps=steps_ode,
                         clip_to_limits=True,
                         return_aux=True,
+                        obs_dropout_mc_k=mc_k,
                     )
                     cached_kp = {
                         cam: kp_t[0].detach().cpu().numpy()
@@ -220,6 +312,7 @@ class SimPolicyEvaluator:
                         ode_steps=steps_ode,
                         clip_to_limits=True,
                         return_aux=False,
+                        obs_dropout_mc_k=mc_k,
                     )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 latencies_ms.append(latency_ms)
@@ -247,6 +340,36 @@ class SimPolicyEvaluator:
             cur_src_tgt_xy_cm = float(np.linalg.norm(src_pos[:2] - tgt_pos[:2])) * 100.0
             min_pinch_src_xy_cm = min(min_pinch_src_xy_cm, cur_pinch_src_xy_cm)
             max_src_z_cm = max(max_src_z_cm, cur_src_z_cm)
+
+            if step < 75:
+                self._fk_data.qpos[:5] = action_6d[:5]
+                mujoco.mj_kinematics(self.env.model, self._fk_data)
+                cmd_pinch_z_cm = float(self._fk_data.site(self.env._pinch_site_id).xpos[2]) * 100.0
+                z_gap_cmd_cm = float(pinch_pos[2] * 100.0 - cmd_pinch_z_cm)
+                src_disp_xy_cm = float(np.linalg.norm(src_pos[:2] - init_src_pos[:2])) * 100.0
+                gripper_src_contacts: list[str] = []
+                for c_i in range(self.env.data.ncon):
+                    con = self.env.data.contact[c_i]
+                    g1 = self._geom_id_to_name[int(con.geom1)]
+                    g2 = self._geom_id_to_name[int(con.geom2)]
+                    pair = f"{g1}<->{g2}"
+                    is_grp = "jaw" in pair or "palm" in pair or "gripper" in pair
+                    if is_grp and (
+                        spec.source_object in pair or "cup" in pair or "pen_holder" in pair
+                    ):
+                        gripper_src_contacts.append(pair)
+                steps_75.append(
+                    {
+                        "step": int(step),
+                        "grip_cmd": float(action_6d[5]),
+                        "pinch_src_xy_cm": cur_pinch_src_xy_cm,
+                        "pinch_src_z_cm": cur_pinch_src_dz_cm,
+                        "src_z_cm": cur_src_z_cm,
+                        "src_disp_xy_cm": src_disp_xy_cm,
+                        "z_gap_cmd_cm": z_gap_cmd_cm,
+                        "gripper_src_contacts": gripper_src_contacts,
+                    }
+                )
 
             if grasp_close_step is None and float(action_6d[5]) < 0.48:
                 grasp_close_step = int(step)
@@ -307,6 +430,7 @@ class SimPolicyEvaluator:
         tgt_pos_end = self.env.data.body(tgt_bid).xpos
         final_src_tgt_xy_cm = float(np.linalg.norm(src_pos_end[:2] - tgt_pos_end[:2])) * 100.0
         max_src_lift_cm = max(0.0, max_src_z_cm - init_src_z_cm)
+        grasp_cls, first_pad = classify_grasp_steps(steps_75)
 
         status_text = diagnose_rollout_status(
             constraints=constraints,
@@ -358,6 +482,9 @@ class SimPolicyEvaluator:
             grasp_close_step=grasp_close_step,
             grasp_close_xy_cm=grasp_close_xy_cm,
             grasp_close_dz_cm=grasp_close_dz_cm,
+            grasp_class=grasp_cls,
+            grasp_blocked=(grasp_cls == "BLOCKED"),
+            blocked_pad=first_pad if grasp_cls == "BLOCKED" else None,
             gif_path=saved_gif_path,
             strip_path=saved_strip_path,
         )
@@ -369,6 +496,8 @@ class SimPolicyEvaluator:
         *,
         max_steps: int = 280,
         ode_steps: int | None = None,
+        obs_dropout_mc_k: int | None = None,
+        seed_offset: int = 0,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
         save_gif: bool = True,
@@ -398,6 +527,8 @@ class SimPolicyEvaluator:
             gt_actions=gt_actions,
             max_steps=max_steps,
             ode_steps=ode_steps,
+            obs_dropout_mc_k=obs_dropout_mc_k,
+            seed_offset=seed_offset,
             exec_horizon=exec_horizon,
             use_temporal_ensemble=use_temporal_ensemble,
             save_gif=save_gif,
@@ -413,10 +544,13 @@ class SimPolicyEvaluator:
         *,
         episodes_per_task: int = 20,
         train_h5_path: str | Path = "data/sim_demos_v2.h5",
-        test_base_seed: int = 90000,
+        test_base_seed: int = 9000,
         domain_rand: bool = False,
         max_steps: int = 280,
         ode_steps: int | None = None,
+        obs_dropout_mc_k: int | None = None,
+        seed_offset: int = 0,
+        num_workers: int = 1,
         exec_horizon: int = 1,
         use_temporal_ensemble: bool = True,
         save_report_path: str | Path | None = None,
@@ -425,6 +559,9 @@ class SimPolicyEvaluator:
         """Run strict evaluation on both training seeds and held-out test seeds (>=20 per task)."""
         n_per_task = max(1, int(episodes_per_task))
         bench_ode_steps = int(ode_steps if ode_steps is not None else 5)
+        mc_k = int(
+            obs_dropout_mc_k if obs_dropout_mc_k is not None else self.obs_dropout_mc_k
+        )
         train_seeds_by_task: dict[int, list[int]] = {0: [], 1: [], 2: []}
         target_dom = "sim_dr" if domain_rand else "sim_clean"
 
@@ -452,28 +589,50 @@ class SimPolicyEvaluator:
             if verbose:
                 print(
                     f"\n=== [{split_name.upper()} SPLIT] ({n_per_task} seeds/task, "
-                    f"domain={target_dom}, strict all_constraints_passed) ==="
+                    f"domain={target_dom}, mc_k={mc_k}, seed_offset={seed_offset}, "
+                    f"strict all_constraints_passed) ==="
                 )
+
+            jobs: list[dict[str, Any]] = []
             for tid in range(3):
-                t_eps: list[EpisodeEvalResult] = []
                 for s in seeds_map[tid]:
-                    res = self.run_episode(
-                        task_id=tid,
-                        seed=s,
-                        domain_rand=domain_rand,
-                        episode_label=f"{split_name}_t{tid}_s{s}",
-                        max_steps=max_steps,
-                        ode_steps=bench_ode_steps,
-                        exec_horizon=exec_horizon,
-                        use_temporal_ensemble=use_temporal_ensemble,
-                        save_gif=False,
-                        save_strip=False,
+                    jobs.append(
+                        {
+                            "task_id": tid,
+                            "seed": s,
+                            "domain_rand": domain_rand,
+                            "episode_label": f"{split_name}_t{tid}_s{s}",
+                            "max_steps": max_steps,
+                            "ode_steps": bench_ode_steps,
+                            "obs_dropout_mc_k": mc_k,
+                            "seed_offset": seed_offset,
+                            "exec_horizon": exec_horizon,
+                            "use_temporal_ensemble": use_temporal_ensemble,
+                            "save_gif": False,
+                            "save_strip": False,
+                        }
                     )
-                    t_eps.append(res)
-                    all_eps.append(res)
+
+            if num_workers > 1:
+                nw = min(int(num_workers), len(jobs))
+                worker_args = [
+                    (str(self.checkpoint_path), str(self.device), mc_k, jobs[i::nw])
+                    for i in range(nw)
+                ]
+                with mp.get_context("spawn").Pool(nw) as pool:
+                    worker_lists = pool.map(_benchmark_worker, worker_args)
+                by_label = {d["episode_label"]: EpisodeEvalResult(**d) for sub in worker_lists for d in sub}
+                all_eps = [by_label[j["episode_label"]] for j in jobs]
+            else:
+                all_eps = [self.run_episode(**j) for j in jobs]
+
+            for tid in range(3):
+                t_eps = [r for r in all_eps if r.task_id == tid]
                 passed = sum(1 for r in t_eps if r.all_constraints_passed)
                 total = len(t_eps)
                 rate = passed / float(max(total, 1))
+                blocked_eps = [r for r in t_eps if r.grasp_blocked]
+                pads = Counter(r.blocked_pad for r in blocked_eps)
                 close_xys = [r.grasp_close_xy_cm for r in t_eps if r.grasp_close_xy_cm is not None]
                 close_dzs = [r.grasp_close_dz_cm for r in t_eps if r.grasp_close_dz_cm is not None]
                 centered_closes = sum(
@@ -485,6 +644,12 @@ class SimPolicyEvaluator:
                     "passed": passed,
                     "total": total,
                     "strict_success_rate": rate,
+                    "blocked_count": len(blocked_eps),
+                    "blocked_by_pad": {
+                        "fixed_jaw_pad": pads.get("fixed_jaw_pad", 0),
+                        "moving_jaw_pad": pads.get("moving_jaw_pad", 0),
+                        "neighbor": pads.get("neighbor", 0),
+                    },
                     "centered_grasp_close_count": centered_closes,
                     "centered_grasp_close_rate": centered_closes / float(max(total, 1)),
                     "mean_grasp_close_xy_cm": float(np.mean(close_xys)) if close_xys else float("nan"),
@@ -492,11 +657,13 @@ class SimPolicyEvaluator:
                     "mean_min_src_xy_cm": float(np.mean([r.min_pinch_src_xy_cm for r in t_eps])),
                     "mean_max_lift_cm": float(np.mean([r.max_src_lift_cm for r in t_eps])),
                     "mean_final_tgt_xy_cm": float(np.mean([r.final_src_tgt_xy_cm for r in t_eps])),
+                    "mean_latency_ms": float(np.mean([r.mean_latency_ms for r in t_eps])),
                 }
                 if verbose:
                     print(
                         f"  Task {tid} ({TASK_SPECS[tid].name}): "
                         f"{passed}/{total} ({rate * 100.0:.1f}%) | "
+                        f"blocked={len(blocked_eps)}/{total} | "
                         f"centered_close={centered_closes}/{total} "
                         f"(close_xy={per_task[tid]['mean_grasp_close_xy_cm']:.2f}cm, "
                         f"close_dz={per_task[tid]['mean_grasp_close_dz_cm']:+.2f}cm) | "
@@ -507,6 +674,8 @@ class SimPolicyEvaluator:
             tot_passed = sum(1 for r in all_eps if r.all_constraints_passed)
             tot_count = len(all_eps)
             tot_rate = tot_passed / float(max(tot_count, 1))
+            tot_blocked = [r for r in all_eps if r.grasp_blocked]
+            tot_pads = Counter(r.blocked_pad for r in tot_blocked)
             tot_centered = sum(
                 1
                 for r in all_eps
@@ -518,6 +687,7 @@ class SimPolicyEvaluator:
                 print(
                     f"--> {split_name.upper()} STRICT PASS TOTAL: "
                     f"{tot_passed}/{tot_count} ({tot_rate * 100.0:.1f}%) | "
+                    f"BLOCKED: {len(tot_blocked)}/{tot_count} | "
                     f"CENTERED CLOSE (<1.5cm): {tot_centered}/{tot_count} "
                     f"({tot_centered / float(max(tot_count, 1)) * 100.0:.1f}%)"
                 )
@@ -525,10 +695,17 @@ class SimPolicyEvaluator:
                 "passed": tot_passed,
                 "total": tot_count,
                 "strict_success_rate": tot_rate,
+                "blocked_count": len(tot_blocked),
+                "blocked_by_pad": {
+                    "fixed_jaw_pad": tot_pads.get("fixed_jaw_pad", 0),
+                    "moving_jaw_pad": tot_pads.get("moving_jaw_pad", 0),
+                    "neighbor": tot_pads.get("neighbor", 0),
+                },
                 "centered_grasp_close_count": tot_centered,
                 "centered_grasp_close_rate": tot_centered / float(max(tot_count, 1)),
                 "mean_grasp_close_xy_cm": float(np.mean(all_close_xys)) if all_close_xys else float("nan"),
                 "mean_grasp_close_dz_cm": float(np.mean(all_close_dzs)) if all_close_dzs else float("nan"),
+                "mean_latency_ms": float(np.mean([r.mean_latency_ms for r in all_eps])) if all_eps else 0.0,
                 "per_task": per_task,
                 "episodes": [r.to_dict() for r in all_eps],
             }
@@ -541,10 +718,28 @@ class SimPolicyEvaluator:
         train_summary = _run_split("train", train_seeds_by_task)
         test_summary = _run_split("test", test_seeds_by_task)
 
+        overall_passed = int(train_summary["passed"]) + int(test_summary["passed"])
+        overall_total = int(train_summary["total"]) + int(test_summary["total"])
+        overall_blocked = int(train_summary["blocked_count"]) + int(test_summary["blocked_count"])
+
         report = {
             "checkpoint": str(self.checkpoint_path),
             "domain": target_dom,
             "episodes_per_task": n_per_task,
+            "obs_dropout_mc_k": mc_k,
+            "seed_offset": int(seed_offset),
+            "overall_passed": overall_passed,
+            "overall_total": overall_total,
+            "overall_strict_success_rate": overall_passed / float(max(overall_total, 1)),
+            "overall_blocked_count": overall_blocked,
+            "overall_blocked_by_pad": {
+                k: int(train_summary["blocked_by_pad"].get(k, 0))
+                + int(test_summary["blocked_by_pad"].get(k, 0))
+                for k in ("fixed_jaw_pad", "moving_jaw_pad", "neighbor")
+            },
+            "overall_mean_latency_ms": float(
+                0.5 * (train_summary["mean_latency_ms"] + test_summary["mean_latency_ms"])
+            ),
             "train_split": train_summary,
             "test_split": test_summary,
         }

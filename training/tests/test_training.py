@@ -247,6 +247,18 @@ def test_flow_matcher_and_temporal_ensembler() -> None:
     assert torch.all(sampled_actions <= high + 1e-5)
     assert set(aux["keypoints"].keys()) == set(CAMERA_NAMES)
 
+    mc_actions = matcher.sample_action_chunk(
+        policy,
+        {k: v[:1] for k, v in batch["obs"].items()},
+        task_id=1,
+        ode_steps=4,
+        obs_dropout_mc_k=4,
+    )
+    assert isinstance(mc_actions, torch.Tensor)
+    assert mc_actions.shape == (1, 16, 6)
+    assert policy.training is False
+    assert policy.obs_dropout.training is False
+
     # Temporal Ensembler test
     ensembler = TemporalEnsembler(chunk_size=4, action_dim=6, decay=0.1)
     c0 = np.ones((4, 6), dtype=np.float32) * 1.0

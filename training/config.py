@@ -74,6 +74,7 @@ class AlloyTrainConfig:
 
     # Inference & memory settings
     ode_steps: int = 10
+    obs_dropout_mc_k: int = 0
     temporal_ensemble_decay: float = 0.05
     rolling_window_size: int = 8192
     seed: int = 42
