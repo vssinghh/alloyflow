@@ -92,6 +92,7 @@ def collect_sim_demos(
     trajectory_version: str = "v1",
     perturbation: str | None = None,
     reference_h5: str | Path | None = None,
+    reuse_reference_groups: bool = False,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Collect verified simulation demonstrations that pass all 4 constraint checks.
@@ -106,10 +107,12 @@ def collect_sim_demos(
             `domain_rand=True` (`sim_dr`), matching the 50 Clean + 50 DR design.
         base_seed: Starting RNG seed for reproducible spawns.
         max_attempts_Factor: Maximum seed attempts multiplier per required episode.
-        trajectory_version: Expert trajectory version ('v1', 'v2', or 'v2_dart').
-        perturbation: Optional perturbation mode (e.g. 'dart').
+        trajectory_version: Expert trajectory version ('v1', 'v2', 'v2_dart', or 'v2_dart_full').
+        perturbation: Optional perturbation mode (e.g. 'dart' or 'dart_full').
         reference_h5: Optional existing `.h5` dataset whose exact `(task_id, seed, domain)`
-            schedule should be re-collected.
+            schedule should be included first before any new seeds.
+        reuse_reference_groups: If True and `reference_h5` already has matching
+            `trajectory_version`, copy verified reference HDF5 groups directly.
         verbose: Whether to print progress updates.
     """
     out_file = Path(output_path)
@@ -124,16 +127,19 @@ def collect_sim_demos(
     per_task_counts: dict[int, int] = {t: 0 for t in tasks}
     failed_seeds: list[tuple[int, int, str, dict[str, Any]]] = []
 
-    ref_schedule: list[tuple[int, int, str]] | None = None
+    ref_schedule: list[tuple[str, int, int, str, str]] | None = None
     if reference_h5 is not None:
         with h5py.File(reference_h5, "r") as rf:
             rroot = rf.get("data", rf)
+            root_tver = str(rroot.attrs.get("trajectory_version", "v1"))
             rkeys = sorted(k for k in rroot if k.startswith("demo_"))
             ref_schedule = [
                 (
+                    k,
                     int(rroot[k].attrs["task_id"]),
                     int(rroot[k].attrs["seed"]),
                     str(rroot[k].attrs.get("domain", "sim_clean")),
+                    str(rroot[k].attrs.get("trajectory_version", root_tver)),
                 )
                 for k in rkeys
                 if int(rroot[k].attrs["task_id"]) in tasks
@@ -149,40 +155,106 @@ def collect_sim_demos(
 
         if ref_schedule is not None:
             max_seed_by_task: dict[int, int] = {
-                t: max((s for rt, s, _ in ref_schedule if rt == t), default=base_seed + t * 10_000)
+                t: max((s for _, rt, s, _, _ in ref_schedule if rt == t), default=base_seed + t * 10_000)
                 for t in tasks
             }
-            for tid, seed, domain_tag in ref_schedule:
-                env.domain_rand = (domain_tag == "sim_dr")
-                cur_seed = seed
-                while True:
-                    total_attempts += 1
-                    ep_data = planner.generate_episode(
-                        task_id=tid,
-                        seed=cur_seed,
-                        trim_dwell=(trajectory_version == "v1"),
-                        trajectory_version=trajectory_version,
-                    )
-                    constraints = ep_data["constraints"]
-                    if constraints["all_constraints_passed"] and ep_data["num_steps"] > 0:
-                        write_episode_to_hdf5(
-                            h5_file=h5f,
-                            episode_idx=total_saved,
-                            episode_data=ep_data,
-                            domain=domain_tag,
-                        )
-                        total_saved += 1
-                        per_task_counts[tid] = per_task_counts.get(tid, 0) + 1
-                        if verbose and (per_task_counts[tid] % 25 == 0):
-                            print(
-                                f"[SimCollector-{trajectory_version}] Task {tid} ({TASK_SPECS[tid].name}): "
-                                f"saved {per_task_counts[tid]} (total={total_saved}/{len(ref_schedule)}, domain={domain_tag})",
-                                flush=True,
+            ref_h5_handle = h5py.File(reference_h5, "r") if reuse_reference_groups else None
+            try:
+                for tid in tasks:
+                    ref_task_items = [item for item in ref_schedule if item[1] == tid]
+                    target_for_task = max(int(episodes_per_task), len(ref_task_items))
+                    if split_clean_and_dr or any(item[3] == "sim_dr" for item in ref_task_items) and any(item[3] == "sim_clean" for item in ref_task_items):
+                        clean_target = target_for_task // 2
+                        dom_plan = [("sim_clean", clean_target), ("sim_dr", target_for_task - clean_target)]
+                    else:
+                        dom_tag = "sim_dr" if domain_rand else "sim_clean"
+                        dom_plan = [(dom_tag, target_for_task)]
+
+                    for domain_tag, dom_target in dom_plan:
+                        env.domain_rand = (domain_tag == "sim_dr")
+                        ref_dom_items = [item for item in ref_task_items if item[3] == domain_tag]
+                        saved_for_dom = 0
+
+                        for ref_key, _, seed, _, ref_tver in ref_dom_items:
+                            if saved_for_dom >= dom_target:
+                                break
+                            if (
+                                reuse_reference_groups
+                                and ref_h5_handle is not None
+                                and ref_tver == trajectory_version
+                            ):
+                                rroot = ref_h5_handle.get("data", ref_h5_handle)
+                                grp_name = f"demo_{total_saved:04d}"
+                                ref_h5_handle.copy(rroot[ref_key], h5f, name=grp_name)
+                                total_attempts += 1
+                                total_saved += 1
+                                saved_for_dom += 1
+                                per_task_counts[tid] = per_task_counts.get(tid, 0) + 1
+                                continue
+
+                            cur_seed = seed
+                            while True:
+                                total_attempts += 1
+                                ep_data = planner.generate_episode(
+                                    task_id=tid,
+                                    seed=cur_seed,
+                                    trim_dwell=(trajectory_version == "v1"),
+                                    trajectory_version=trajectory_version,
+                                )
+                                constraints = ep_data["constraints"]
+                                if constraints["all_constraints_passed"] and ep_data["num_steps"] > 0:
+                                    write_episode_to_hdf5(
+                                        h5_file=h5f,
+                                        episode_idx=total_saved,
+                                        episode_data=ep_data,
+                                        domain=domain_tag,
+                                    )
+                                    total_saved += 1
+                                    saved_for_dom += 1
+                                    per_task_counts[tid] = per_task_counts.get(tid, 0) + 1
+                                    if verbose and (per_task_counts[tid] % 25 == 0):
+                                        print(
+                                            f"[SimCollector-{trajectory_version}] Task {tid} ({TASK_SPECS[tid].name}): "
+                                            f"saved {per_task_counts[tid]}/{target_for_task} (total={total_saved}, domain={domain_tag})",
+                                            flush=True,
+                                        )
+                                    break
+                                failed_seeds.append((tid, cur_seed, domain_tag, constraints))
+                                max_seed_by_task[tid] += 1
+                                cur_seed = max_seed_by_task[tid]
+
+                        while saved_for_dom < dom_target:
+                            max_seed_by_task[tid] += 1
+                            cur_seed = max_seed_by_task[tid]
+                            total_attempts += 1
+                            ep_data = planner.generate_episode(
+                                task_id=tid,
+                                seed=cur_seed,
+                                trim_dwell=(trajectory_version == "v1"),
+                                trajectory_version=trajectory_version,
                             )
-                        break
-                    failed_seeds.append((tid, cur_seed, domain_tag, constraints))
-                    max_seed_by_task[tid] += 1
-                    cur_seed = max_seed_by_task[tid]
+                            constraints = ep_data["constraints"]
+                            if constraints["all_constraints_passed"] and ep_data["num_steps"] > 0:
+                                write_episode_to_hdf5(
+                                    h5_file=h5f,
+                                    episode_idx=total_saved,
+                                    episode_data=ep_data,
+                                    domain=domain_tag,
+                                )
+                                total_saved += 1
+                                saved_for_dom += 1
+                                per_task_counts[tid] = per_task_counts.get(tid, 0) + 1
+                                if verbose and (per_task_counts[tid] % 25 == 0 or per_task_counts[tid] == target_for_task):
+                                    print(
+                                        f"[SimCollector-{trajectory_version}] Task {tid} ({TASK_SPECS[tid].name}): "
+                                        f"saved {per_task_counts[tid]}/{target_for_task} (total={total_saved}, domain={domain_tag})",
+                                        flush=True,
+                                    )
+                            else:
+                                failed_seeds.append((tid, cur_seed, domain_tag, constraints))
+            finally:
+                if ref_h5_handle is not None:
+                    ref_h5_handle.close()
         else:
             for tid in tasks:
                 saved_for_task = 0

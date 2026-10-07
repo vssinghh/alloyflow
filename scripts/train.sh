@@ -128,7 +128,7 @@ DOWNLOADED_FINAL=0
 pull_remote_checkpoints() {
     echo "[train] Pulling checkpoints from Colab VM into $LOCAL_SAVE_DIR..."
     colab download -s "$SESSION_CLEAN" /content/train.log "$LOCAL_SAVE_DIR/train.log" >/dev/null 2>&1 || true
-    for fname in train_config.json training_history.json best_policy.pt latest_policy.pt pretrained_vision.pt; do
+    for fname in train_config.json training_history.json best_policy.pt latest.pt latest_policy.pt pretrained_vision.pt epoch_010.pt epoch_020.pt epoch_030.pt epoch_040.pt; do
         colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/$fname" "$LOCAL_SAVE_DIR/$fname" >/dev/null 2>&1 || true
     done
 }
@@ -170,7 +170,7 @@ fi
 
 DRIVE_ACCESS_TOKEN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"]["access_token"])' "$GDRIVE_TOKEN_JSON")"
 
-# Inspect TRAIN_ARGS for dataset files (--sim-data, --real-data) and --pretrained-checkpoint
+# Inspect TRAIN_ARGS for dataset files (--sim-data, --real-data), --pretrained-checkpoint, and --resume
 PARSED_META="$(python3 - "${TRAIN_ARGS[@]}" <<'PY'
 import argparse
 import json
@@ -182,6 +182,8 @@ p.add_argument("--mode", default="sim_only")
 p.add_argument("--sim-data", default="data/sim_demos_v2_dart_full.h5")
 p.add_argument("--real-data", default="data/real_demos.h5")
 p.add_argument("--pretrained-checkpoint", default="")
+p.add_argument("--resume", action="store_true")
+p.add_argument("--resume-from", default="")
 args, _ = p.parse_known_args(sys.argv[1:])
 
 req_data = ["data/loc_layouts_3000.npz"]
@@ -195,11 +197,15 @@ print(json.dumps({
     "required_data": req_data,
     "required_basenames": [os.path.basename(x) for x in req_data],
     "pretrained_checkpoint": args.pretrained_checkpoint,
+    "resume": bool(args.resume),
+    "resume_from": args.resume_from,
 }))
 PY
 )"
 
 PRETRAINED_CKPT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pretrained_checkpoint"])' "$PARSED_META")"
+RESUME_FLAG="$(python3 -c 'import json,sys; print("1" if json.loads(sys.argv[1])["resume"] else "0")' "$PARSED_META")"
+RESUME_FROM_CKPT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["resume_from"])' "$PARSED_META")"
 REQUIRED_BASENAMES_JSON="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])["required_basenames"]))' "$PARSED_META")"
 
 if [[ -n "$PRETRAINED_CKPT" && ! -f "$PRETRAINED_CKPT" ]]; then
@@ -244,12 +250,27 @@ if ! colab new -s "$SESSION_CLEAN" --gpu "$GPU_TYPE"; then
 fi
 SESSION_CREATED=1
 
-echo "[train] Uploading local code snapshot to Colab VM..."
+echo "[train] Uploading local code snapshot and Drive auth to Colab VM..."
 colab upload -s "$SESSION_CLEAN" "$LOCAL_SAVE_DIR/code_snapshot.tgz" /content/code_snapshot.tgz
+colab upload -s "$SESSION_CLEAN" "$GDRIVE_TOKEN_JSON" /content/.gdrive_auth.json
 
 if [[ -n "$PRETRAINED_CKPT" ]]; then
     echo "[train] Uploading pretrained checkpoint ($PRETRAINED_CKPT) to Colab VM..."
     colab upload -s "$SESSION_CLEAN" "$PRETRAINED_CKPT" /content/pretrained_input.pt
+fi
+
+if [[ -n "$RESUME_FROM_CKPT" && -f "$RESUME_FROM_CKPT" ]]; then
+    echo "[train] Uploading resume checkpoint ($RESUME_FROM_CKPT) to Colab VM..."
+    colab upload -s "$SESSION_CLEAN" "$RESUME_FROM_CKPT" /content/resume_input.pt
+elif [[ "$RESUME_FLAG" == "1" && -f "$LOCAL_SAVE_DIR/latest.pt" ]]; then
+    echo "[train] Uploading local latest.pt for resume to Colab VM..."
+    colab upload -s "$SESSION_CLEAN" "$LOCAL_SAVE_DIR/latest.pt" /content/resume_input.pt
+    if [[ -f "$LOCAL_SAVE_DIR/best_policy.pt" ]]; then
+        colab upload -s "$SESSION_CLEAN" "$LOCAL_SAVE_DIR/best_policy.pt" /content/resume_best_input.pt
+    fi
+    if [[ -f "$LOCAL_SAVE_DIR/training_history.json" ]]; then
+        colab upload -s "$SESSION_CLEAN" "$LOCAL_SAVE_DIR/training_history.json" /content/resume_history_input.json
+    fi
 fi
 
 TRAIN_ARGS_JSON="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${TRAIN_ARGS[@]}")"
@@ -262,6 +283,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.parse
 import urllib.request
 
 import torch
@@ -293,6 +315,52 @@ if pretrained_rel and os.path.exists("/content/pretrained_input.pt"):
     shutil.move("/content/pretrained_input.pt", dest_ckpt)
     print(f"[VM] Placed pretrained checkpoint at {dest_ckpt}", flush=True)
 
+remote_ckpt_dir = os.path.join(repo_dir, "checkpoints", "$RUN_NAME")
+os.makedirs(remote_ckpt_dir, exist_ok=True)
+
+resume_from_rel = "$RESUME_FROM_CKPT"
+resume_flag = "$RESUME_FLAG"
+folder_id = "$DRIVE_FOLDER_ID"
+token = "$DRIVE_ACCESS_TOKEN"
+
+if os.path.exists("/content/resume_input.pt"):
+    if resume_from_rel:
+        dest_res = resume_from_rel if os.path.isabs(resume_from_rel) else os.path.join(repo_dir, resume_from_rel)
+        os.makedirs(os.path.dirname(dest_res), exist_ok=True)
+        shutil.move("/content/resume_input.pt", dest_res)
+    else:
+        shutil.move("/content/resume_input.pt", os.path.join(remote_ckpt_dir, "latest.pt"))
+        shutil.copyfile(os.path.join(remote_ckpt_dir, "latest.pt"), os.path.join(remote_ckpt_dir, "latest_policy.pt"))
+    if os.path.exists("/content/resume_best_input.pt"):
+        shutil.move("/content/resume_best_input.pt", os.path.join(remote_ckpt_dir, "best_policy.pt"))
+    if os.path.exists("/content/resume_history_input.json"):
+        shutil.move("/content/resume_history_input.json", os.path.join(remote_ckpt_dir, "training_history.json"))
+    print(f"[VM] Placed local resume checkpoint in {remote_ckpt_dir}", flush=True)
+elif resume_flag == "1":
+    # Fallback: fetch latest.pt from Google Drive ckpt_<run_name> folder if not uploaded from local
+    q_dir = (
+        f"'{folder_id}' in parents and name = 'ckpt_${RUN_NAME}' "
+        f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    u_dir = f"https://www.googleapis.com/drive/v3/files?{urllib.parse.urlencode({'q': q_dir, 'fields': 'files(id,name)'})}"
+    req_d = urllib.request.Request(u_dir, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req_d) as resp_d:
+        d_folders = json.loads(resp_d.read().decode("utf-8")).get("files", [])
+    if d_folders:
+        sub_id = d_folders[0]["id"]
+        q_files = f"'{sub_id}' in parents and trashed = false"
+        u_files = f"https://www.googleapis.com/drive/v3/files?{urllib.parse.urlencode({'q': q_files, 'fields': 'files(id,name)'})}"
+        req_f = urllib.request.Request(u_files, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req_f) as resp_f:
+            for f_item in json.loads(resp_f.read().decode("utf-8")).get("files", []):
+                if f_item["name"] in ("latest.pt", "best_policy.pt", "training_history.json"):
+                    dl_u = f"https://www.googleapis.com/drive/v3/files/{f_item['id']}?alt=media"
+                    dl_r = urllib.request.Request(dl_u, headers={"Authorization": f"Bearer {token}"})
+                    dest_f = os.path.join(remote_ckpt_dir, f_item["name"])
+                    with urllib.request.urlopen(dl_r) as rr, open(dest_f, "wb") as out_f:
+                        shutil.copyfileobj(rr, out_f)
+                    print(f"[VM] Pulled {f_item['name']} from Drive folder ckpt_${RUN_NAME}", flush=True)
+
 subprocess.run(
     [sys.executable, "-m", "pip", "install", "-q", "mujoco>=3.1.0"],
     check=True,
@@ -303,8 +371,6 @@ subprocess.run(
 )
 print("[VM] Installed alloyflow and mujoco.", flush=True)
 
-folder_id = "$DRIVE_FOLDER_ID"
-token = "$DRIVE_ACCESS_TOKEN"
 required_basenames = set(json.loads('''$REQUIRED_BASENAMES_JSON'''))
 data_dir = os.path.join(repo_dir, "data")
 os.makedirs(data_dir, exist_ok=True)
@@ -357,6 +423,8 @@ runner_code = (
     "import os, subprocess, sys\n"
     f"os.chdir({repo_dir!r})\n"
     "os.environ['MUJOCO_GL'] = 'egl'\n"
+    f"os.environ['ALLOYFLOW_DRIVE_FOLDER_ID'] = {folder_id!r}\n"
+    "os.environ['ALLOYFLOW_GDRIVE_AUTH_JSON'] = '/content/.gdrive_auth.json'\n"
     "with open('/content/train.log', 'w') as logf:\n"
     f"    proc = subprocess.Popen({cmd!r}, stdout=logf, stderr=subprocess.STDOUT)\n"
     "    rc = proc.wait()\n"
@@ -405,8 +473,14 @@ while true; do
             tail -n +"$((PRINTED_LINES + 1))" "$TMP_LOG"
             PRINTED_LINES="$TOTAL_LINES"
             cp "$TMP_LOG" "$LOCAL_SAVE_DIR/train.log"
+            colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/latest.pt" "$LOCAL_SAVE_DIR/latest.pt" >/dev/null 2>&1 || true
             colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/best_policy.pt" "$LOCAL_SAVE_DIR/best_policy.pt" >/dev/null 2>&1 || true
             colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/training_history.json" "$LOCAL_SAVE_DIR/training_history.json" >/dev/null 2>&1 || true
+            for snap in epoch_010.pt epoch_020.pt epoch_030.pt epoch_040.pt; do
+                if [[ ! -f "$LOCAL_SAVE_DIR/$snap" ]]; then
+                    colab download -s "$SESSION_CLEAN" "$REMOTE_CKPT_DIR/$snap" "$LOCAL_SAVE_DIR/$snap" >/dev/null 2>&1 || true
+                fi
+            done
         fi
     else
         FAIL_COUNT=$((FAIL_COUNT + 1))

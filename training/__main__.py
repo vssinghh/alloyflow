@@ -40,6 +40,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Pretrained checkpoint path (defaults to default_finetune_checkpoint in finetune mode).",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from <save-dir>/latest.pt if present.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Explicit checkpoint path (.pt) to resume training from.",
+    )
+    parser.add_argument(
         "--save-dir",
         type=str,
         default="",
@@ -97,11 +108,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "finetune" and pretrained is None:
         pretrained = d.default_finetune_checkpoint
 
+    resume_ckpt = args.resume_from if args.resume_from else ("auto" if args.resume else None)
+
     config_kwargs = {
         "train_mode": args.mode,
         "sim_data_path": args.sim_data,
         "real_data_path": args.real_data,
         "pretrained_checkpoint": pretrained,
+        "resume_checkpoint": resume_ckpt,
         "save_dir": args.save_dir,
         "real_ratio": args.real_ratio,
         "epochs": args.epochs,

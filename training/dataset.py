@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterator
+import os
 from pathlib import Path
 from typing import Any
 
@@ -215,16 +216,46 @@ class HDF5DemoDataset:
             self.task_ids = torch.empty((total_steps,), dtype=torch.long)
             self.obj_xy = torch.zeros((total_steps, 12), dtype=torch.float32)
             self.obj_xy_mask = torch.zeros((total_steps, 12), dtype=torch.float32)
-            self.rgb_cache: dict[str, torch.Tensor] = {
-                cam: torch.empty((total_steps, h, w, c), dtype=torch.uint8)
-                for cam in self.camera_names
-            }
+
+            total_rgb_bytes = int(total_steps) * len(self.camera_names) * int(h) * int(w) * int(c)
+            force_mmap = os.environ.get("ALLOYFLOW_FORCE_DISK_MMAP", "0") == "1"
+            self.use_disk_mmap = bool(force_mmap or total_rgb_bytes > 8 * (1024 ** 3))
+            self._rgb_mmap_files: dict[str, Any] = {}
+            self._rgb_memmaps: dict[str, np.memmap] = {}
+            self.rgb_cache: dict[str, torch.Tensor] = {}
+
+            if self.use_disk_mmap:
+                mmap_dir = self.h5_path.parent
+                mmap_dir.mkdir(parents=True, exist_ok=True)
+                for cam in self.camera_names:
+                    mmap_path = mmap_dir / f".af_rgb_mmap_{os.getpid()}_{id(self)}_{cam}.bin"
+                    f_obj = open(mmap_path, "w+b")
+                    try:
+                        os.unlink(mmap_path)
+                    except OSError:
+                        pass
+                    nbytes = int(total_steps) * int(h) * int(w) * int(c)
+                    f_obj.truncate(nbytes)
+                    mm = np.memmap(
+                        f_obj,
+                        dtype=np.uint8,
+                        mode="r+",
+                        shape=(total_steps, h, w, c),
+                    )
+                    self._rgb_mmap_files[cam] = f_obj
+                    self._rgb_memmaps[cam] = mm
+                    self.rgb_cache[cam] = torch.from_numpy(mm)
+            else:
+                self.rgb_cache = {
+                    cam: torch.empty((total_steps, h, w, c), dtype=torch.uint8)
+                    for cam in self.camera_names
+                }
 
             cursor = 0
             self.task_counts: dict[int, int] = defaultdict(int)
             self.domain_counts: dict[str, int] = defaultdict(int)
 
-            for k in interleaved_keys:
+            for ep_i, k in enumerate(interleaved_keys):
                 grp = root[k]
                 tid = int(grp.attrs.get("task_id", 0))
                 dom = str(grp.attrs.get("domain", "sim_clean"))
@@ -274,11 +305,32 @@ class HDF5DemoDataset:
                 self.task_counts[tid] += 1
                 self.domain_counts[dom] += 1
                 cursor = end
+                if self.use_disk_mmap and (ep_i + 1) % 100 == 0:
+                    self.evict_rgb_page_cache()
 
         if dummy_sim_env is not None:
             dummy_sim_env.close()
 
+        if self.use_disk_mmap:
+            self.evict_rgb_page_cache()
+
         self.norm_stats = self.compute_norm_stats()
+
+    def evict_rgb_page_cache(self) -> None:
+        """Flush and advise the OS kernel to drop clean mmap pages outside the active rolling window."""
+        if not getattr(self, "use_disk_mmap", False):
+            return
+        for cam, mm in self._rgb_memmaps.items():
+            try:
+                mm.flush()
+            except Exception:
+                pass
+            f_obj = self._rgb_mmap_files.get(cam)
+            if f_obj is not None and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                try:
+                    os.posix_fadvise(f_obj.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
 
     def __len__(self) -> int:
         return self.num_steps
@@ -495,9 +547,13 @@ class MultiModeBatchLoader:
                 reps = (b + len(perm) - 1) // len(perm)
                 perm = perm.repeat(reps)
             n_batches = max(len(ds) // b, 1)
+            batches_per_win = max(ds.rolling_window_size // b, 1)
             for i in range(n_batches):
                 batch_idx = perm[i * b : (i + 1) * b]
                 yield ds.get_batch(batch_idx, device=self.device)
+                if (i + 1) % batches_per_win == 0:
+                    ds.evict_rgb_page_cache()
+            ds.evict_rgb_page_cache()
             return
 
         # Co-training mode: mix (1 - real_ratio) Sim + real_ratio Real in every minibatch
