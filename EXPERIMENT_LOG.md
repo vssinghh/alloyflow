@@ -342,19 +342,17 @@ Eliminate dropout (`dropout = 0.0`) from the flow velocity head so standard sing
 
 ***
 
-## Experiment 08b: Zero-Dropout Flow Velocity Network & Input-Modality Shortcut Ablation (`exp08b_cooldown_k0`)
+## Experiment 08b: Zero-Dropout Flow Velocity Network (`exp08b_cooldown_k0`)
 
-* **Commit / Checkpoint**: `c64dc1f` | `checkpoints/exp08b_cooldown_k0/best_policy.pt` (`5`-ep cooldown), `checkpoints/exp08_nodropout_scratch/best_policy.pt` (`40`-ep velocity head from scratch), & `checkpoints/exp08_nodropout_e2e/best_policy.pt` (Stage A + B zero-regularization ablation)
+* **Commit / Checkpoint**: `c64dc1f` | `checkpoints/exp08b_cooldown_k0/best_policy.pt` (`5`-ep cooldown, [`scripts/run_cooldown_exp08.py`](./scripts/run_cooldown_exp08.py)), `checkpoints/exp08_nodropout_scratch/best_policy.pt` (`40`-ep velocity head from scratch, [`scripts/train_vel_head_nodropout_scratch.py`](./scripts/train_vel_head_nodropout_scratch.py)), & `checkpoints/exp08_nodropout_e2e/best_policy.pt` (end-to-end ablation)
 
 ### 1. Hypothesis
-1. **Stage B (`predict_velocity` neuron dropout)**: With `900` full-DART demos (`128,919` frames), domain randomization, and continuous Gaussian flow noise $x_0 \sim \mathcal{N}(0, I)$, the `9` neuron-dropout layers inside `predict_velocity` (`obs_dropout` + `4x ResMLPBlock`) are unnecessary and create a `LayerNorm + SiLU` variance shift between `.train()` and `.eval()`. Setting `dropout = 0.0` (either via a 5-epoch cooldown or training the velocity head from scratch for 40 epochs) will allow single-pass `.eval()` to match or beat Monte Carlo dropout at `350 Hz` CPU speed.
-2. **Stage A (`extract_obs_features` input-modality regularizers)**: We also tested whether the Stage A input-modality regularizers (`proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`, `keypoint_noise = 0.01`) can be set to `0.0` during end-to-end training (`exp08_nodropout_e2e`), or whether they are required to prevent proprioceptive shortcut learning (causal confusion).
+With `900` full-DART demos (`128,919` frames), domain randomization, and continuous Gaussian flow noise $x_0 \sim \mathcal{N}(0, I)$, the `9` neuron-dropout layers inside `predict_velocity` (`obs_dropout` + `4x ResMLPBlock`) are unnecessary and create a `LayerNorm + SiLU` variance shift between `.train()` and `.eval()`. Setting `dropout = 0.0` (either via a 5-epoch cooldown or training the velocity head from scratch for 40 epochs) will allow single-pass `.eval()` to match or beat Monte Carlo dropout at `350 Hz` CPU speed.
 
 ### 2. Changes
-* **5-Epoch Zero-Dropout Cooldown (`checkpoints/exp08b_cooldown_k0/best_policy.pt`)**: Froze the `Exp 08` Stage A observation encoders in `.eval()` mode, set all `9` velocity-head dropout layers to `p = 0.0`, and fine-tuned the `Flow ResMLP` for `5` epochs (`lr = 5e-5 -> 1e-6`, `12.5 seconds` total).
-* **40-Epoch Zero-Dropout Velocity Head From Scratch (`checkpoints/exp08_nodropout_scratch/best_policy.pt`)**: Reset all `778,592` parameters of `predict_velocity` to random initialization (`seed = 42`) and trained for `40` epochs (`lr = 5e-4 -> 2.5e-5`) with `dropout = 0.0` on the Stage A features (`proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`, `keypoint_noise = 0.01`).
-* **End-to-End Zero-Regularization Ablation (`checkpoints/exp08_nodropout_e2e/best_policy.pt`)**: Trained both Stage A and Stage B end-to-end (`27` epochs + `5`-epoch cooldown to `lr = 1e-6`) with `dropout = 0.0` AND all Stage A input regularizers set to `0.0`.
-* **Code Cleanup ([`training/config.py`](./training/config.py), [`training/flow_matching.py`](./training/flow_matching.py), [`evaluation/evaluator.py`](./evaluation/evaluator.py))**: Set `dropout = 0.0` permanently in `AlloyTrainConfig`, kept the Stage A anti-shortcut regularizers (`keypoint_noise = 0.01`, `proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`), and removed `obs_dropout_mc_k` across the codebase.
+* **5-Epoch Zero-Dropout Cooldown (`checkpoints/exp08b_cooldown_k0/best_policy.pt`, [`scripts/run_cooldown_exp08.py`](./scripts/run_cooldown_exp08.py))**: Froze the `Exp 08` Stage A observation encoders in `.eval()` mode, set all `9` velocity-head dropout layers to `p = 0.0`, and fine-tuned the `Flow ResMLP` for `5` epochs (`lr = 5e-5 -> 1e-6`, `12.5 seconds` total).
+* **40-Epoch Zero-Dropout Velocity Head From Scratch (`checkpoints/exp08_nodropout_scratch/best_policy.pt`, [`scripts/train_vel_head_nodropout_scratch.py`](./scripts/train_vel_head_nodropout_scratch.py))**: Reset all `778,592` parameters of `predict_velocity` to random initialization (`seed = 42`) and trained for `40` epochs (`lr = 5e-4 -> 2.5e-5`) with `dropout = 0.0` on the Stage A features (`keypoint_noise = 0.01`, `proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`).
+* **Code Cleanup ([`training/config.py`](./training/config.py), [`training/flow_matching.py`](./training/flow_matching.py), [`evaluation/evaluator.py`](./evaluation/evaluator.py))**: Set `dropout = 0.0` permanently in `AlloyTrainConfig`, kept the four input noise settings at `0.01 / 0.02 / 0.10 / 0.05`, and removed `obs_dropout_mc_k` across the codebase.
 
 ### 3. Results
 
@@ -362,7 +360,6 @@ Eliminate dropout (`dropout = 0.0`) from the flow velocity head so standard sing
 | :--- | :---: | :---: | :---: | :---: |
 | **Inference Mode & CPU Speed (`ode_steps = 5`)** | `8` MC passes (`250 Hz`) | **Single-pass `.eval()` (`350 Hz`)** | **Single-pass `.eval()` (`350 Hz`)** | Single-pass `.eval()` (`350 Hz`) |
 | **Open-Loop Flow Loss (`cfm_loss`) / `val_ode_mse`** | `0.0524` / `0.00192` | `0.0439` / **`0.00151`** | `0.0435` / **`0.00172`** | `0.0377` / `0.00169` |
-| **`obs_proj` Weight Norm on `overhead_cam`** | `5.86` | **`5.85`** | **`5.06`** | `4.75` (`-19.0%`) |
 | **Reached Object (`< 2.0 cm`)** | `120 / 120 (100.0%)` | **`120 / 120 (100.0%)`** | **`120 / 120 (100.0%)`** | `120 / 120 (100.0%)` |
 | **Centered Grasp (`< 1.5 cm` at close)** | `117 / 120 (97.5%)` | **`118 / 120 (98.3%)`** | **`117 / 120 (97.5%)`** | `107 / 120 (89.2%)` |
 | **Rim-Blocked Grasps** | `45 / 120` | **`21 / 120` (`-53.3%`)** | **`36 / 120` (`-20.0%`)** | `34 / 120` |
@@ -373,9 +370,9 @@ Eliminate dropout (`dropout = 0.0`) from the flow velocity head so standard sing
 * **What worked**:
   - **Both the 5-epoch cooldown and 40-epoch zero-dropout velocity head reach `112 / 120 (93.3%)` in standard `.eval()` mode**: Training `predict_velocity` from scratch with `dropout = 0.0` matches the `93.3%` total pass rate (`98.3%` Train, `88.3%` Test, and `95.0%` on `Task 2: stack_cup_on_cube`), proving that neuron dropout inside the flow ODE network is unnecessary once `900` full-DART demos are present.
   - **Rim-blocked grasps drop by half (`45 -> 21`) and inference runs at `350 Hz` on CPU**: Training and inference now use the exact same deterministic `.eval()` pass with zero test-time workarounds.
-* **What failed in the `exp08_nodropout_e2e` ablation (and why Stage A regularizers must stay active)**:
-  - Zeroing out the Stage A input-modality regularizers (`proprio_noise_std = 0.0`, `proprio_drop_prob = 0.0`, `wrist_cam_drop_prob = 0.0`, `keypoint_noise = 0.0`) produced the **lowest open-loop training loss** (`cfm_loss = 0.0377`, `val_ode_mse = 0.00169`) but dropped closed-loop rollout success from **`93.3%` to `62.5%`** (`50 / 120` at Epoch 27; `75 / 120` after 5-epoch cooldown).
-  - **Root cause (Proprioceptive Causal Confusion)**: When `proprio` ($q_t$) is 100% noiseless and never dropped during Stage 2 training, the network minimizes open-loop MSE by extrapolating the minimum-jerk spline directly from $q_t$ and `wrist_cam`, reducing its `obs_proj` weight norm on `overhead_cam` by **`19.0%` (`5.86 -> 4.75`)**. In closed-loop physics, once the grasped cup or pen holder loads the wrist servo and occludes `wrist_cam`, the policy cuts its transit lift arc **`3.0 cm` short (`+9.7 cm` vs `+12.7 cm`)**, clipping the rim of the target bowl or Rubik's cube during placement. Keeping `proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`, and `keypoint_noise = 0.01` in Stage A while setting `dropout = 0.0` in Stage B prevents this shortcut and preserves the `112 / 120 (93.3%)` closed-loop pass rate.
+* **End-to-end ablation (`exp08_nodropout_e2e`)**: trained from scratch with dropout 0 *and* all four input noise settings at 0 (`keypoint_noise`, `proprio_noise_std`, `proprio_drop_prob`, `wrist_cam_drop_prob`). Stopped at 27 of 40 epochs (Colab limit), then 5 cooldown epochs. Result: 75/120 (train 39, test 36), BLOCKED 34, mean lift 9.7 cm vs 12.7 cm for Exp08b. It had the lowest training loss of any run, so offline loss did not predict closed-loop success.
+
+  Takeaway: do not turn off the input noise settings together with dropout. Two changes plus a shortened run means the cause is not isolated. Hypothesis (unconfirmed): without input noise, the model leans on joint readings over the cameras and cuts the lift arc short.
 
 ### 4. What to Try Next
 Evaluate real-robot (`SO-ARM101`) finetuning (`Mode 3`) and `50/50` co-training (`Mode 4`) starting from `checkpoints/exp08b_cooldown_k0/best_policy.pt`.
