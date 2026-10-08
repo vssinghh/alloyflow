@@ -91,7 +91,10 @@ alloyflow/                        # Repository Root
 │   └── tests/
 │
 ├── scripts/
-│   └── train.sh                  # Unified training launcher (--colab GPU or --local Mac MPS)
+│   ├── check_train_eval_shift.py # Train vs eval action prediction shift check
+│   ├── run_cooldown_exp08.py     # Exp08 5-epoch zero-dropout velocity-head cooldown
+│   ├── train.sh                  # Unified training launcher (--colab GPU or --local Mac MPS)
+│   └── train_vel_head_nodropout_scratch.py # Exp08b 40-epoch velocity head from scratch
 │
 ├── DESIGN.md
 ├── EXPERIMENT_LOG.md
@@ -108,16 +111,16 @@ alloyflow/                        # Repository Root
 2. **Train Policy (`sim_only`, `real_only`, `finetune`, `cotrain`)**:
    ```bash
    # Train on remote Colab GPU (--colab) or local Mac GPU (--local)
-   ./scripts/train.sh exp08_dart_full_900 --colab --mode sim_only --epochs 40
-   ./scripts/train.sh exp08_dart_full_900 --local --mode sim_only --epochs 40
+   ./scripts/train.sh exp09_e2e_nodropout --colab --mode sim_only --epochs 40
+   ./scripts/train.sh exp09_e2e_nodropout --local --mode sim_only --epochs 40
 
    # Co-train on 50% Sim + 50% Real
    uv run python -m training --mode cotrain --real-ratio 0.5
    ```
 3. **Evaluate Policy (`120`-Episode Benchmark or Per-Demo Diagnostic GIFs)**:
    ```bash
-   uv run python -m evaluation --checkpoint checkpoints/exp08b_cooldown_k0/best_policy.pt --benchmark --episodes 20
-   uv run python -m evaluation --checkpoint checkpoints/exp08b_cooldown_k0/best_policy.pt --demos demo_0000,demo_0301,demo_0600
+   uv run python -m evaluation --checkpoint checkpoints/exp09_e2e_nodropout/best_policy.pt --benchmark --episodes 20
+   uv run python -m evaluation --checkpoint checkpoints/exp09_e2e_nodropout/best_policy.pt --demos demo_0000,demo_0301,demo_0600
    ```
 4. **Run Tests**:
    ```bash
@@ -262,7 +265,7 @@ All 4 training modes (`sim_only`, `real_only`, `finetune`, `cotrain`) train the 
 | `num_flow_samples` (`K`) / `gripper_weight` | `4` / `2.5` | Stratified flow samples per CNN pass and loss weight on gripper joint `5`. |
 | `shift_pad` / `keypoint_noise` / `dropout` | `4` / `0.01` / `0.0` | Image shift augmentation (`px`), anti-shortcut keypoint noise, and zero `ResMLP` dropout (`0.0`). |
 | `proprio_noise_std` / `proprio_drop_prob` / `wrist_cam_drop_prob` | `0.02` / `0.10` / `0.05` | Anti-shortcut sensor noise and modality dropout probabilities in `extract_obs_features`. |
-| `batch_size` / `epochs` / `rolling_window_size` | `128` / `60` / `8192` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `8,192`-sample memmap window. |
+| `batch_size` / `epochs` / `rolling_window_size` | `128` / `40` / `8192` | AdamW (`wd = 1e-4`), `512`-sample `val_ode_mse` check, and `8,192`-sample memmap window. |
 | `ode_steps` / `temporal_ensemble_decay` | `10` (`5` CLI) / `0.05` | Euler ODE steps (`10` config default, `5` via `--ode-steps 5`) and $w_i = \exp(-0.05 \cdot i)$ blending. |
 
 ***

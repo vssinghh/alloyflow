@@ -37,13 +37,13 @@ uv run python -m collection --domain sim --task all --episodes 300 --trajectory-
 uv run python -m collection --domain real --task 0 --episodes 20
 
 # 2. Train policy (Colab GPU or local Mac MPS; modes: sim_only | real_only | finetune | cotrain)
-./scripts/train.sh exp08_dart_full_900 --colab --mode sim_only --epochs 40
-./scripts/train.sh exp08_dart_full_900 --local --mode sim_only --epochs 40
+./scripts/train.sh exp09_e2e_nodropout --colab --mode sim_only --epochs 40
+./scripts/train.sh exp09_e2e_nodropout --local --mode sim_only --epochs 40
 uv run python -m training --mode cotrain --real-ratio 0.5
 
 # 3. Evaluate policy (120-episode benchmark or per-demo diagnostic GIFs)
-uv run python -m evaluation --checkpoint checkpoints/exp08b_cooldown_k0/best_policy.pt --benchmark --episodes 20
-uv run python -m evaluation --checkpoint checkpoints/exp08b_cooldown_k0/best_policy.pt --demos demo_0000,demo_0301,demo_0600
+uv run python -m evaluation --checkpoint checkpoints/exp09_e2e_nodropout/best_policy.pt --benchmark --episodes 20
+uv run python -m evaluation --checkpoint checkpoints/exp09_e2e_nodropout/best_policy.pt --demos demo_0000,demo_0301,demo_0600
 
 # 4. Run unit tests
 uv run pytest

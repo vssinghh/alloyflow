@@ -27,7 +27,7 @@ class AlloyTrainConfig:
     real_data_path: str = "data/real_demos.h5"
     pretrained_checkpoint: str | None = None
     resume_checkpoint: str | None = None
-    default_finetune_checkpoint: str = "checkpoints/exp08b_cooldown_k0/best_policy.pt"
+    default_finetune_checkpoint: str = "checkpoints/exp09_e2e_nodropout/best_policy.pt"
     save_dir: str = ""
     real_ratio: float = 0.5
 
@@ -66,7 +66,7 @@ class AlloyTrainConfig:
 
     # Optimization schedule
     batch_size: int = 128
-    epochs: int = 60
+    epochs: int = 40
     lr: float = 5e-4
     finetune_lr: float = 1e-4
     weight_decay: float = 1e-4

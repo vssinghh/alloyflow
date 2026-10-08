@@ -16,7 +16,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/exp08b_cooldown_k0/best_policy.pt",
+        default="checkpoints/exp09_e2e_nodropout/best_policy.pt",
         help="Path to trained policy checkpoint (.pt).",
     )
     parser.add_argument(

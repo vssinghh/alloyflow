@@ -25,6 +25,7 @@ Each experiment is evaluated on **`120` closed-loop episodes** (`60` training se
 | **Exp 07 (`exp07_dart_full`)** | Source + target recovery demos (`data/sim_demos_v2_dart_full.h5`, `300` total) | `118 / 120` (`98.3%`) | `104 / 120` (`86.7%`) | `40 / 60` (`66.7%`) | `26 / 60` (`43.3%`) | `66 / 120` (`55.0%`) | Target release error drops (`1.11 -> 0.90 cm`), placement misses drop `35%`, and `Task 1` jumps `42.5% -> 62.5%` |
 | **Exp 08 (`exp08_dart_full_900`)** | `3x` dataset scale (`900` full-DART demos, `300/task`) + test-time dropout averaging | `120 / 120` (`100.0%`) | `117 / 120` (`97.5%`) | `57 / 60` (`95.0%`) | `50 / 60` (`83.3%`) | `107 / 120` (`89.2%`) | `900` demos + fixing velocity-head dropout shift nearly doubles unseen test pass (`43.3% -> 83.3%`) |
 | **Exp 08b (`exp08b_cooldown_k0`)** | **Zero-dropout flow velocity head (`dropout = 0.0`, single-pass `.eval()`)** | **`120 / 120` (`100.0%`)** | **`118 / 120` (`98.3%`)** | **`58 / 60` (`96.7%`)** | **`54 / 60` (`90.0%`)** | **`112 / 120` (`93.3%`)** | **Removing dropout eliminates train/eval mismatch, cuts rim blocks in half (`45 -> 21`), and reaches `93.3%` at `350 Hz` CPU** |
+| **Exp 09 (`exp09_e2e_nodropout`)** | **Clean 40-epoch end-to-end retrain (`dropout = 0.0`, Stage A noise retained)** | **`120 / 120` (`100.0%`)** | **`118 / 120` (`98.3%`)** | **`59 / 60` (`98.3%`)** | **`55 / 60` (`91.7%`)** | **`114 / 120` (`95.0%`)** | **End-to-end training with `dropout = 0.0` and Stage A input noise reaches `95.0%` (`97.5%` on Tasks 1 and 2) with zero velocity-head shift** |
 
 ***
 
@@ -377,4 +378,37 @@ With `900` full-DART demos (`128,919` frames), domain randomization, and continu
 ### 4. What to Try Next
 Evaluate real-robot (`SO-ARM101`) finetuning (`Mode 3`) and `50/50` co-training (`Mode 4`) starting from `checkpoints/exp08b_cooldown_k0/best_policy.pt`.
 
+***
 
+## Experiment 09: Clean 40-Epoch End-to-End Retrain with Zero Velocity-Head Dropout (`exp09_e2e_nodropout`)
+
+* **Commit / Checkpoint**: `2c78e94` | `checkpoints/exp09_e2e_nodropout/best_policy.pt`
+
+### 1. Hypothesis
+In `Exp 08b`, setting `dropout = 0.0` in the velocity head (`predict_velocity`) via either a 5-epoch cooldown or a 40-epoch velocity-head retrain on frozen Stage A features achieved `112 / 120 (93.3%)`, whereas turning off the four Stage A input noise settings (`keypoint_noise`, `proprio_noise_std`, `proprio_drop_prob`, `wrist_cam_drop_prob`) alongside `dropout = 0.0` in `exp08_nodropout_e2e` dropped pass rate to `75 / 120 (62.5%)`. We hypothesized that a full 40-epoch end-to-end retrain (training both the Stage A encoders and Stage B velocity head from scratch) with `dropout = 0.0` while keeping the four Stage A input noise settings at `0.01 / 0.02 / 0.10 / 0.05` would match or exceed `Exp 08b` in single-pass `.eval()` mode with zero post-training cooldown step.
+
+### 2. Changes
+* **End-to-End Training (`checkpoints/exp09_e2e_nodropout/best_policy.pt`)**: Trained the full policy (encoders and velocity head) for `40` epochs (`batch_size = 128`, `lr = 5e-4 -> 2.5e-5`, `seed = 42`) on `data/sim_demos_v2_dart_full_900.h5` from `checkpoints/exp02c_no_attn/pretrained_vision.pt` with `dropout = 0.0` and `keypoint_noise = 0.01`, `proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`.
+* **Train vs. Eval Shift Verification ([`scripts/check_train_eval_shift.py`](./scripts/check_train_eval_shift.py))**: Added a diagnostic script comparing the 16-pass `.train()` average against `.eval()` across `240` validation frames (`predict_velocity` shift is exact `0.000000` across all 6 joints).
+* **Baseline Promotion ([`training/config.py`](./training/config.py), [`evaluation/evaluator.py`](./evaluation/evaluator.py), [`evaluation/__main__.py`](./evaluation/__main__.py))**: Promoted `checkpoints/exp09_e2e_nodropout/best_policy.pt` to the default checkpoint and set `epochs = 40` as the default schedule.
+
+### 3. Results
+
+| Metric (`120` Episodes: `60` Train + `60` Test) | Exp 08b (`5`-Ep Cooldown, `dropout=0.0`) | **Exp 09 (`40`-Ep E2E Retrain, `dropout=0.0`)** |
+| :--- | :---: | :---: |
+| **Open-Loop Flow Loss (`cfm_loss`) / `val_ode_mse`** | `0.0439` / **`0.00151`** | **`0.0410`** / `0.00211` |
+| **Camera Localization (`ov_src` / `tp_src` / `wr_src`)** | `0.49 cm` / `0.41 cm` / `1.61 cm` | `0.51 cm` / `0.41 cm` / `1.63 cm` |
+| **Velocity Head `.train()` vs `.eval()` Shift (`shoulder_pan`)** | `0.000000 rad` | **`0.000000 rad`** (`full avg16 - eval = -0.001099 rad`) |
+| **Reached Object (`< 2.0 cm`)** | `120 / 120 (100.0%)` | **`120 / 120 (100.0%)`** |
+| **Centered Grasp (`< 1.5 cm` at close)** | **`118 / 120 (98.3%)`** (`60` tr, `58` te) | `117 / 120 (97.5%)` (`60` tr, `57` te) |
+| **Rim-Blocked Grasps (`fixed / moving / neighbor`)** | **`21 / 120`** (`0 / 21 / 0`) | `34 / 120` (`0 / 34 / 0`) |
+| **Lifted Object (`> 2.0 cm`) & Mean Lift (`All 120 / Lifted 118`)** | **`118 / 120`** (`12.29 cm` / `12.49 cm`) | **`118 / 120`** (`12.02 cm` / `12.22 cm`) |
+| **Task Pass by Task (`Task 0 / Task 1 / Task 2`)** | **`38/40 (95%)`** / `38/40 (95%)` / `36/40 (90%)` | `36/40 (90%)` / **`39/40 (97.5%)`** / **`39/40 (97.5%)`** |
+| **Task Success (`Train / Test / Total`)** | `58/60 (96.7%)` / `54/60 (90.0%)` / `112/120 (93.3%)` | **`59/60 (98.3%)` / `55/60 (91.7%)` / `114/120 (95.0%)`** |
+
+* **What worked**:
+  - **Highest overall and held-out test accuracy (`114 / 120 = 95.0%` total, `55 / 60 = 91.7%` test)**: Training the full network end-to-end from scratch with `dropout = 0.0` and the four Stage A input noise settings active beats `Exp 08b` (`114/120` vs. `112/120`), reaching **`39 / 40 (97.5%)`** on both `Task 1 (pick_cup_to_bowl)` and `Task 2 (stack_cup_on_cube)` and **`59 / 60 (98.3%)`** on the training split.
+  - **Clean single-stage recipe**: Confirms that keeping the four Stage A input regularizers (`keypoint_noise = 0.01`, `proprio_noise_std = 0.02`, `proprio_drop_prob = 0.10`, `wrist_cam_drop_prob = 0.05`) while setting `dropout = 0.0` in the velocity head produces a `95.0%` policy directly from `trainer.py` without any separate cooldown script.
+
+### 4. What to Try Next
+Evaluate physical **SO-ARM101** real-robot demonstrations (`Mode 2: real_only`), Sim-to-Real finetuning (`Mode 3: finetune`), and `50/50` Sim+Real co-training (`Mode 4: cotrain`) starting from `checkpoints/exp09_e2e_nodropout/best_policy.pt`.

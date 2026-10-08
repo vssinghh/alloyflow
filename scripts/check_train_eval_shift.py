@@ -159,7 +159,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="checkpoints/exp08b_cooldown_k0/best_policy.pt",
+        default="checkpoints/exp09_e2e_nodropout/best_policy.pt",
         help="Path to policy checkpoint.",
     )
     parser.add_argument(

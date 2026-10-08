@@ -164,7 +164,7 @@ class SimPolicyEvaluator:
 
     def __init__(
         self,
-        checkpoint_path: str | Path = "checkpoints/exp08b_cooldown_k0/best_policy.pt",
+        checkpoint_path: str | Path = "checkpoints/exp09_e2e_nodropout/best_policy.pt",
         device: str = "auto",
         cam_render_size: int = 256,
     ) -> None:
